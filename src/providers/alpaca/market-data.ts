@@ -149,24 +149,87 @@ export class AlpacaMarketDataProvider implements MarketDataProvider {
   }
 
   async getQuote(symbol: string): Promise<Quote> {
-    const response = await this.client.dataRequest<AlpacaQuotesResponse>(
-      "GET",
-      `/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`
-    );
+    const path = `/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`;
+    try {
+      const response = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path);
+      const quote = response.quotes[symbol];
+      if (quote) {
+        return parseQuote(symbol, quote);
+      }
+    } catch {
+      // Fall through to IEX fallback.
+    }
 
-    const quote = response.quotes[symbol];
+    const fallback = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path, { feed: "iex" });
+    const quote = fallback.quotes[symbol];
     if (!quote) {
+      try {
+        const snapshot = await this.getSnapshot(symbol);
+        if (snapshot.latest_quote) {
+          return snapshot.latest_quote;
+        }
+        const tradePrice = snapshot.latest_trade?.price;
+        if (tradePrice) {
+          return {
+            symbol,
+            bid_price: tradePrice,
+            bid_size: snapshot.latest_trade?.size ?? 0,
+            ask_price: tradePrice,
+            ask_size: snapshot.latest_trade?.size ?? 0,
+            timestamp: snapshot.latest_trade?.timestamp ?? new Date().toISOString(),
+          };
+        }
+      } catch {
+        // Fall through to bar fallback.
+      }
+
+      try {
+        const barResponse = await this.client.dataRequest<AlpacaLatestBarsResponse>(
+          "GET",
+          `/v2/stocks/${encodeURIComponent(symbol)}/bars/latest`,
+          { feed: "iex" }
+        );
+        const bar = barResponse.bars[symbol];
+        if (bar) {
+          return {
+            symbol,
+            bid_price: bar.c,
+            bid_size: 0,
+            ask_price: bar.c,
+            ask_size: 0,
+            timestamp: bar.t,
+          };
+        }
+      } catch {
+        // Ignore bar fallback errors.
+      }
+
       throw new Error(`No quote data for ${symbol}`);
     }
     return parseQuote(symbol, quote);
   }
 
   async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
-    const response = await this.client.dataRequest<AlpacaQuotesResponse>(
-      "GET",
-      "/v2/stocks/quotes/latest",
-      { symbols: symbols.join(",") }
-    );
+    const path = "/v2/stocks/quotes/latest";
+    let response: AlpacaQuotesResponse | null = null;
+
+    try {
+      response = await this.client.dataRequest<AlpacaQuotesResponse>(
+        "GET",
+        path,
+        { symbols: symbols.join(",") }
+      );
+    } catch {
+      response = null;
+    }
+
+    if (!response || Object.keys(response.quotes ?? {}).length === 0) {
+      response = await this.client.dataRequest<AlpacaQuotesResponse>(
+        "GET",
+        path,
+        { symbols: symbols.join(","), feed: "iex" }
+      );
+    }
 
     const result: Record<string, Quote> = {};
     for (const [symbol, quote] of Object.entries(response.quotes)) {
