@@ -131,6 +131,7 @@ export default function App() {
   const [setupChecked, setSetupChecked] = useState(false)
   const [time, setTime] = useState(new Date())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
+  const [closingSymbol, setClosingSymbol] = useState<string | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -184,7 +185,7 @@ export default function App() {
       }
     }
 
-    if (setupChecked && !showSetup) {
+    if (setupChecked && !showSetup && !showSettings) {
       fetchStatus()
       const interval = setInterval(fetchStatus, 5000)
       const timeInterval = setInterval(() => setTime(new Date()), 1000)
@@ -194,7 +195,7 @@ export default function App() {
         clearInterval(timeInterval)
       }
     }
-  }, [setupChecked, showSetup])
+  }, [setupChecked, showSetup, showSettings])
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -208,6 +209,32 @@ export default function App() {
     const data = await res.json()
     if (data.ok && status) {
       setStatus({ ...status, config: data.data })
+    }
+  }
+
+  const handleClosePosition = async (symbol: string) => {
+    if (closingSymbol) return
+    if (!confirm(`Close ${symbol} position?`)) return
+    setClosingSymbol(symbol)
+    try {
+      const res = await authFetch(`${API_BASE}/positions/close`, {
+        method: 'POST',
+        body: JSON.stringify({ symbol, reason: 'manual_close' }),
+      })
+      const data = await res.json()
+      if (!data.ok) {
+        alert(data.error || `Failed to close ${symbol}`)
+        return
+      }
+      const statusRes = await authFetch(`${API_BASE}/status`)
+      const statusData = await statusRes.json()
+      if (statusData.ok) {
+        setStatus(statusData.data)
+      }
+    } catch {
+      alert(`Failed to close ${symbol}`)
+    } finally {
+      setClosingSymbol(null)
     }
   }
 
@@ -403,6 +430,7 @@ export default function App() {
                         <th className="hud-label text-right py-2 px-2 hidden md:table-cell">Value</th>
                         <th className="hud-label text-right py-2 px-2">P&L</th>
                         <th className="hud-label text-center py-2 px-2">Trend</th>
+                        <th className="hud-label text-right py-2 px-2">Close</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -412,6 +440,8 @@ export default function App() {
                         const posEntry = status?.positionEntries?.[pos.symbol]
                         const staleness = status?.stalenessAnalysis?.[pos.symbol]
                         const holdTime = posEntry ? Math.floor((Date.now() - posEntry.entry_time) / 3600000) : null
+                        const isCryptoPos = isCryptoSymbol(pos.symbol, config?.crypto_symbols)
+                        const canClose = isMarketOpen || isCryptoPos
                         
                         return (
                           <motion.tr 
@@ -442,7 +472,7 @@ export default function App() {
                                 }
                               >
                                 <span className="cursor-help border-b border-dotted border-hud-text-dim">
-                                  {isCryptoSymbol(pos.symbol, config?.crypto_symbols) && (
+                                  {isCryptoPos && (
                                     <span className="text-hud-warning mr-1">₿</span>
                                   )}
                                   {pos.symbol}
@@ -462,6 +492,16 @@ export default function App() {
                               <div className="flex justify-center">
                                 <Sparkline data={priceHistory} width={60} height={20} />
                               </div>
+                            </td>
+                            <td className="py-2 px-2 text-right">
+                              <button
+                                className="hud-button text-[10px] px-2 py-1"
+                                onClick={() => handleClosePosition(pos.symbol)}
+                                disabled={!canClose || closingSymbol === pos.symbol}
+                                title={!canClose ? 'Market closed for equities' : 'Close position'}
+                              >
+                                {closingSymbol === pos.symbol ? 'Closing...' : 'Close'}
+                              </button>
                             </td>
                           </motion.tr>
                         )

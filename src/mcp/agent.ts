@@ -38,6 +38,7 @@ import { classifyEvent, generateResearchReport, summarizeLearnedRules } from "..
 import { getDTE } from "../providers/alpaca/options";
 import type { LLMProvider, OptionsProvider } from "../providers/types";
 import type { OptionsOrderPreview } from "./types";
+import { normalizeSymbol, toSlashUsdSymbol } from "../utils/symbols";
 
 export class MahoragaMcpAgent extends McpAgent<Env> {
   server = new McpServer({
@@ -292,6 +293,31 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
   }
 
   private registerOrderTools(db: ReturnType<typeof createD1Client>, alpaca: ReturnType<typeof createAlpacaProviders>) {
+    const resolveAssetClass = async (symbol: string): Promise<{
+      assetClass: "crypto" | "us_equity";
+      symbol: string;
+    }> => {
+      const normalized = normalizeSymbol(symbol);
+      let asset = await alpaca.trading.getAsset(normalized).catch(() => null);
+
+      if (!asset && !normalized.includes("/")) {
+        const slashUsd = toSlashUsdSymbol(normalized);
+        if (slashUsd && slashUsd !== normalized) {
+          asset = await alpaca.trading.getAsset(slashUsd).catch(() => null);
+        }
+      }
+
+      if (asset?.class === "crypto") {
+        return { assetClass: "crypto", symbol: normalizeSymbol(asset.symbol) };
+      }
+
+      if (normalized.includes("/")) {
+        return { assetClass: "crypto", symbol: normalized };
+      }
+
+      return { assetClass: "us_equity", symbol: normalized };
+    };
+
     this.server.tool(
       "orders-preview",
       "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
@@ -319,40 +345,36 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
             getRiskState(db),
           ]);
 
+          const resolved = await resolveAssetClass(input.symbol);
+
           let estimatedPrice = input.limit_price ?? input.stop_price;
           if (!estimatedPrice) {
-            try {
-              const quote = await alpaca.marketData.getQuote(input.symbol);
-              estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
-            } catch { estimatedPrice = 0; }
+            if (resolved.assetClass === "us_equity") {
+              try {
+                const quote = await alpaca.marketData.getQuote(resolved.symbol);
+                estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
+              } catch { estimatedPrice = 0; }
+            } else {
+              estimatedPrice = 0;
+            }
           }
 
           const estimatedCost = input.notional ?? (input.qty ?? 0) * estimatedPrice;
-
-          // Determine asset class via API lookup, with fallback to symbol pattern
-          let assetClass: "crypto" | "us_equity" = "us_equity";
-          try {
-            const asset = await alpaca.trading.getAsset(input.symbol);
-            if (asset?.class === "crypto") {
-              assetClass = "crypto";
-            }
-          } catch {
-            // Fallback: crypto symbols contain "/" (e.g., BTC/USD)
-            if (input.symbol.includes("/")) {
-              assetClass = "crypto";
-            }
+          let effectiveTimeInForce = input.time_in_force;
+          if (resolved.assetClass === "crypto" && !["gtc", "ioc"].includes(effectiveTimeInForce)) {
+            effectiveTimeInForce = "gtc";
           }
 
           const preview = {
-            symbol: input.symbol.toUpperCase(),
-            asset_class: assetClass,
+            symbol: resolved.symbol,
+            asset_class: resolved.assetClass,
             side: input.side,
             qty: input.qty,
             notional: input.notional,
             order_type: input.order_type,
             limit_price: input.limit_price,
             stop_price: input.stop_price,
-            time_in_force: input.time_in_force,
+            time_in_force: effectiveTimeInForce,
             estimated_price: estimatedPrice,
             estimated_cost: estimatedCost,
           };
@@ -410,7 +432,8 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
 
           const orderParams = validation.order_params!;
           const clock = await alpaca.trading.getClock();
-          if (!clock.is_open && orderParams.time_in_force === "day") {
+          const isCrypto = orderParams.asset_class === "crypto";
+          if (!isCrypto && !clock.is_open && orderParams.time_in_force === "day") {
             return { content: [{ type: "text" as const, text: JSON.stringify(failure({ code: ErrorCode.MARKET_CLOSED, message: "Market closed" }), null, 2) }], isError: true };
           }
 
