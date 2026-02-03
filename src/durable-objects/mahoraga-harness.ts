@@ -1257,10 +1257,10 @@ export class MahoragaHarness extends DurableObject<Env> {
 
       if (market.isCrypto) {
         const momentumAvg = market.momentumAvg ?? 0;
-        const momentumEdge = Math.max(-0.4, Math.min(0.4, momentumAvg / 10));
+        const momentumEdge = Math.max(-0.4, Math.min(0.4, momentumAvg / 5));
         const momentumProb = this.clampProbability(0.5 + momentumEdge);
-        const sentimentProb = this.clampProbability(market.sentimentAvg);
-        calcProb = this.clampProbability(0.7 * momentumProb + 0.3 * sentimentProb);
+        const sentimentProb = this.clampProbability(0.5 + (market.sentimentAvg / 2));
+        calcProb = this.clampProbability(0.65 * momentumProb + 0.35 * sentimentProb);
       } else {
         try {
           const bars = await alpaca.marketData.getBars(market.symbol, "1Day", { limit: lookback });
