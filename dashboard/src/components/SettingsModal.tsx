@@ -485,6 +485,30 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
                 <p className="text-[9px] text-hud-text-dim mt-1">Trade crypto 24/7 based on momentum. Alpaca supports 20+ coins.</p>
               </div>
               <div>
+                <label className="hud-label block mb-1">Top-N by Market Cap (CoinMarketCap)</label>
+                <input
+                  type="number"
+                  step="1"
+                  className="hud-input w-full"
+                  value={localConfig.crypto_universe_top_n ?? 100}
+                  onChange={e => handleChange('crypto_universe_top_n', Number(e.target.value))}
+                  disabled={!localConfig.crypto_enabled}
+                />
+                <p className="text-[9px] text-hud-text-dim mt-1">Set to 0 to use the manual symbol list.</p>
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Universe Refresh (ms)</label>
+                <input
+                  type="number"
+                  step="1000"
+                  className="hud-input w-full"
+                  value={localConfig.crypto_universe_refresh_ms ?? 300000}
+                  onChange={e => handleChange('crypto_universe_refresh_ms', Number(e.target.value))}
+                  disabled={!localConfig.crypto_enabled}
+                />
+                <p className="text-[9px] text-hud-text-dim mt-1">Minimum 120,000 ms. Default 300,000 ms.</p>
+              </div>
+              <div>
                 <label className="hud-label block mb-1">Symbols (comma-separated)</label>
                 <input
                   type="text"
@@ -494,6 +518,7 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
                   disabled={!localConfig.crypto_enabled}
                   placeholder="BTC/USD, ETH/USD, SOL/USD, DOGE/USD, AVAX/USD..."
                 />
+                <p className="text-[9px] text-hud-text-dim mt-1">Requires COINMARKETCAP_API_KEY. Falls back to CoinPaprika if missing.</p>
               </div>
               <div>
                 <label className="hud-label block mb-1">Momentum Threshold (%)</label>
@@ -505,6 +530,18 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
                   onChange={e => handleChange('crypto_momentum_threshold', Number(e.target.value))}
                   disabled={!localConfig.crypto_enabled}
                 />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Min Analyst Confidence (Crypto)</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  className="hud-input w-full"
+                  value={localConfig.crypto_min_analyst_confidence ?? 0.5}
+                  onChange={e => handleChange('crypto_min_analyst_confidence', Number(e.target.value))}
+                  disabled={!localConfig.crypto_enabled}
+                />
+                <p className="text-[9px] text-hud-text-dim mt-1">Overrides global analyst confidence for crypto.</p>
               </div>
               <div>
                 <label className="hud-label block mb-1">Max Position ($)</label>

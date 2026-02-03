@@ -38,6 +38,7 @@ import { classifyEvent, generateResearchReport, summarizeLearnedRules } from "..
 import { getDTE } from "../providers/alpaca/options";
 import type { LLMProvider, OptionsProvider } from "../providers/types";
 import type { OptionsOrderPreview } from "./types";
+import { normalizeSymbol, toSlashUsdSymbol } from "../utils/symbols";
 
 export class MahoragaMcpAgent extends McpAgent<Env> {
   server = new McpServer({
@@ -292,6 +293,31 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
   }
 
   private registerOrderTools(db: ReturnType<typeof createD1Client>, alpaca: ReturnType<typeof createAlpacaProviders>) {
+    const resolveAssetClass = async (symbol: string): Promise<{
+      assetClass: "crypto" | "us_equity";
+      symbol: string;
+    }> => {
+      const normalized = normalizeSymbol(symbol);
+      let asset = await alpaca.trading.getAsset(normalized).catch(() => null);
+
+      if (!asset && !normalized.includes("/")) {
+        const slashUsd = toSlashUsdSymbol(normalized);
+        if (slashUsd && slashUsd !== normalized) {
+          asset = await alpaca.trading.getAsset(slashUsd).catch(() => null);
+        }
+      }
+
+      if (asset?.class === "crypto") {
+        return { assetClass: "crypto", symbol: normalizeSymbol(asset.symbol) };
+      }
+
+      if (normalized.includes("/")) {
+        return { assetClass: "crypto", symbol: normalized };
+      }
+
+      return { assetClass: "us_equity", symbol: normalized };
+    };
+
     this.server.tool(
       "orders-preview",
       "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
@@ -319,26 +345,24 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
             getRiskState(db),
           ]);
 
+          const resolved = await resolveAssetClass(input.symbol);
+
           let estimatedPrice = input.limit_price ?? input.stop_price;
           if (!estimatedPrice) {
-            try {
-              const quote = await alpaca.marketData.getQuote(input.symbol);
-              estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
-            } catch { estimatedPrice = 0; }
+            if (resolved.assetClass === "us_equity") {
+              try {
+                const quote = await alpaca.marketData.getQuote(resolved.symbol);
+                estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
+              } catch { estimatedPrice = 0; }
+            } else {
+              estimatedPrice = 0;
+            }
           }
 
           const estimatedCost = input.notional ?? (input.qty ?? 0) * estimatedPrice;
-
-          let assetClass: "crypto" | "us_equity" = "us_equity";
-          try {
-            const asset = await alpaca.trading.getAsset(input.symbol);
-            if (asset?.class === "crypto") {
-              assetClass = "crypto";
-            }
-          } catch {
-            if (input.symbol.includes("/")) {
-              assetClass = "crypto";
-            }
+          let effectiveTimeInForce = input.time_in_force;
+          if (resolved.assetClass === "crypto" && !["gtc", "ioc"].includes(effectiveTimeInForce)) {
+            effectiveTimeInForce = "gtc";
           }
 
           let effectiveTimeInForce = input.time_in_force;
@@ -347,8 +371,8 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
           }
 
           const preview = {
-            symbol: input.symbol.toUpperCase(),
-            asset_class: assetClass,
+            symbol: resolved.symbol,
+            asset_class: resolved.assetClass,
             side: input.side,
             qty: input.qty,
             notional: input.notional,
