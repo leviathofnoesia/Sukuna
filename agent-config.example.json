@@ -1,5 +1,5 @@
 {
-  "mcp_url": "http://localhost:8787/mcp",
+  "mcp_url": "http://mahoraga.leviath.workers.dev/mcp",
   
   "data_poll_interval_ms": 30000,
   "analyst_interval_ms": 120000,
@@ -9,13 +9,14 @@
   "min_sentiment_score": 0.3,
   "min_analyst_confidence": 0.6,
   "sell_sentiment_threshold": -0.2,
+  "allowed_exchanges": [],
   
   "take_profit_pct": 10,
   "stop_loss_pct": 5,
   "position_size_pct_of_cash": 25,
   
   "llm_model": "gpt-4o-mini",
-  "llm_analyst_model": "gpt-4o",
+  "llm_analyst_model": "gpt-5.2",
   "llm_max_tokens": 500,
   
   "starting_equity": 100000
