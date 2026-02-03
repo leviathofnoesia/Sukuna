@@ -1099,7 +1099,7 @@ export class MahoragaHarness extends DurableObject<Env> {
   }
 
   private computeAlphaConfidence(alpha: number, thresholdOverride?: number): number {
-    const threshold = thresholdOverride ?? this.state.config.alpha_edge_threshold || 0.2;
+    const threshold = (thresholdOverride ?? this.state.config.alpha_edge_threshold) ?? 0.2;
     const span = Math.max(0.05, 1 - threshold);
     const scaled = (alpha - threshold) / span;
     return this.clampProbability(0.5 + scaled * 0.5);
