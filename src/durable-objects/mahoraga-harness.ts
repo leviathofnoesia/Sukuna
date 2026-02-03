@@ -1098,8 +1098,8 @@ export class MahoragaHarness extends DurableObject<Env> {
     return this.clampProbability(0.5 + clamped);
   }
 
-  private computeAlphaConfidence(alpha: number): number {
-    const threshold = this.state.config.alpha_edge_threshold || 0.2;
+  private computeAlphaConfidence(alpha: number, thresholdOverride?: number): number {
+    const threshold = thresholdOverride ?? this.state.config.alpha_edge_threshold || 0.2;
     const span = Math.max(0.05, 1 - threshold);
     const scaled = (alpha - threshold) / span;
     return this.clampProbability(0.5 + scaled * 0.5);
@@ -1280,7 +1280,8 @@ export class MahoragaHarness extends DurableObject<Env> {
       const impliedProb = this.computeImpliedProbability(dailyReturn, avgAbsReturn);
       const alpha = calcProb - impliedProb;
 
-      if (Math.abs(alpha) < minEdge) continue;
+      const minEdgeForMarket = market.isCrypto ? Math.min(minEdge, 0.02) : minEdge;
+      if (Math.abs(alpha) < minEdgeForMarket) continue;
 
       edgePass.push({
         symbol: market.symbol,
@@ -1299,7 +1300,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       .slice(0, 25);
 
     const topAlpha = edgePass
-      .filter((m) => m.alpha >= edgeThreshold)
+      .filter((m) => m.alpha >= (m.isCrypto ? Math.min(edgeThreshold, 0.05) : edgeThreshold))
       .sort((a, b) => b.alpha - a.alpha)
       .slice(0, 10);
 
@@ -1620,18 +1621,41 @@ export class MahoragaHarness extends DurableObject<Env> {
       alphaBySymbol.set(normalizeSymbol(entry.symbol), entry);
     }
 
-    const momentumThreshold = this.state.config.crypto_momentum_threshold || 2.0;
-    const cryptoSignals = this.state.signalCache
+    const primaryMomentum = this.state.config.crypto_momentum_threshold || 2.0;
+    const fallbackMomentum = Math.max(0.25, primaryMomentum * 0.5);
+    let cryptoSignals = this.state.signalCache
       .filter(s => s.isCrypto)
       .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
       .filter(s => !this.isStablecoinSymbol(s.symbol))
-      .filter(s => (s.momentum ?? 0) >= momentumThreshold)
+      .filter(s => (s.momentum ?? 0) >= primaryMomentum)
       .filter(s => alphaBySymbol.has(normalizeSymbol(s.symbol)))
       .sort((a, b) => {
         const alphaA = alphaBySymbol.get(normalizeSymbol(a.symbol))?.alpha ?? 0;
         const alphaB = alphaBySymbol.get(normalizeSymbol(b.symbol))?.alpha ?? 0;
         return alphaB - alphaA;
       });
+
+    if (cryptoSignals.length === 0 && fallbackMomentum < primaryMomentum) {
+      cryptoSignals = this.state.signalCache
+        .filter(s => s.isCrypto)
+        .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
+        .filter(s => !this.isStablecoinSymbol(s.symbol))
+        .filter(s => (s.momentum ?? 0) >= fallbackMomentum)
+        .filter(s => alphaBySymbol.has(normalizeSymbol(s.symbol)))
+        .sort((a, b) => {
+          const alphaA = alphaBySymbol.get(normalizeSymbol(a.symbol))?.alpha ?? 0;
+          const alphaB = alphaBySymbol.get(normalizeSymbol(b.symbol))?.alpha ?? 0;
+          return alphaB - alphaA;
+        });
+
+      if (cryptoSignals.length > 0) {
+        this.log("Crypto", "momentum_fallback", {
+          primary: primaryMomentum,
+          fallback: fallbackMomentum,
+          candidates: cryptoSignals.length,
+        });
+      }
+    }
 
     if (cryptoSignals.length === 0) {
       this.log("Crypto", "entry_skipped_no_signals", {
@@ -1651,7 +1675,8 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
 
-      const alphaConfidence = this.computeAlphaConfidence(alphaEntry.alpha);
+      const cryptoEdgeThreshold = Math.min(this.state.config.alpha_edge_threshold || 0.2, 0.05);
+      const alphaConfidence = this.computeAlphaConfidence(alphaEntry.alpha, cryptoEdgeThreshold);
       const research = await this.researchCryptoAlpha(signal, alphaEntry, alphaConfidence);
       if (research && research.verdict !== "BUY") {
         this.log("Crypto", "research_skip", {
