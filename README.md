@@ -6,7 +6,7 @@ An autonomous, LLM-powered trading agent that runs 24/7 on Cloudflare Workers.
 
 [![Discord](https://img.shields.io/discord/1467592472158015553?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.gg/Ys8KpsW5NN)
 
-MAHORAGA monitors social sentiment from StockTwits and Reddit, uses OpenAI to analyze signals, and executes trades through Alpaca. It runs as a Cloudflare Durable Object with persistent state, automatic restarts, and 24/7 crypto trading support.
+MAHORAGA monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK) to analyze signals, and executes trades through Alpaca. It runs as a Cloudflare Durable Object with persistent state, automatic restarts, and 24/7 crypto trading support.
 
 <img width="1278" height="957" alt="dashboard" src="https://github.com/user-attachments/assets/56473ab6-e2c6-45fc-9e32-cf85e69f1a2d" />
 
@@ -14,7 +14,7 @@ MAHORAGA monitors social sentiment from StockTwits and Reddit, uses OpenAI to an
 
 - **24/7 Operation** — Runs on Cloudflare Workers, no local machine required
 - **Multi-Source Signals** — StockTwits, Reddit (4 subreddits), Twitter confirmation
-- **LLM-Powered Analysis** — OpenAI evaluates signals and makes trading decisions
+- **Multi-Provider LLM** — OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK or Cloudflare AI Gateway
 - **Crypto Trading** — Trade BTC, ETH, SOL around the clock
 - **Options Support** — High-conviction options plays
 - **Staleness Detection** — Auto-exit positions that lose momentum
@@ -27,7 +27,7 @@ MAHORAGA monitors social sentiment from StockTwits and Reddit, uses OpenAI to an
 - Node.js 18+
 - Cloudflare account (free tier works)
 - Alpaca account (free, paper trading supported)
-- OpenAI API key
+- LLM API key (OpenAI, Anthropic, Google, xAI, DeepSeek) or Cloudflare AI Gateway credentials
 
 ## Quick Start
 
@@ -60,11 +60,24 @@ npx wrangler d1 migrations apply mahoraga-db
 # Required
 npx wrangler secret put ALPACA_API_KEY
 npx wrangler secret put ALPACA_API_SECRET
-npx wrangler secret put OPENAI_API_KEY
 
 # API Authentication - generate a secure random token (64+ chars recommended)
 # Example: openssl rand -base64 48
 npx wrangler secret put MAHORAGA_API_TOKEN
+
+# LLM Provider (choose one mode)
+npx wrangler secret put LLM_PROVIDER  # "openai-raw" (default), "ai-sdk", or "cloudflare-gateway"
+npx wrangler secret put LLM_MODEL     # e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4"
+
+# LLM API Keys (based on provider mode)
+npx wrangler secret put OPENAI_API_KEY         # For openai-raw or ai-sdk with OpenAI
+# npx wrangler secret put ANTHROPIC_API_KEY    # For ai-sdk with Anthropic
+# npx wrangler secret put GOOGLE_GENERATIVE_AI_API_KEY  # For ai-sdk with Google
+# npx wrangler secret put XAI_API_KEY          # For ai-sdk with xAI/Grok
+# npx wrangler secret put DEEPSEEK_API_KEY     # For ai-sdk with DeepSeek
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID  # For cloudflare-gateway
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ID          # For cloudflare-gateway
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN       # For cloudflare-gateway
 
 # Optional
 npx wrangler secret put ALPACA_PAPER         # "true" for paper trading (recommended)
@@ -89,7 +102,7 @@ export MAHORAGA_TOKEN="your-api-token"
 
 # Enable the agent
 curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
-  https://your-worker.workers.dev/agent/enable
+  https://mahoraga.bernardoalmeida2004.workers.dev/agent/enable
 ```
 
 ### 6. Monitor
@@ -97,15 +110,15 @@ curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
 ```bash
 # Check status
 curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
-  https://your-worker.workers.dev/agent/status
+  https://mahoraga.bernardoalmeida2004.workers.dev/agent/status
 
 # View logs
 curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
-  https://your-worker.workers.dev/agent/logs
+  https://mahoraga.bernardoalmeida2004.workers.dev/agent/logs
 
 # Emergency kill switch (uses separate KILL_SWITCH_SECRET)
 curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" \
-  https://your-worker.workers.dev/agent/kill
+  https://mahoraga.bernardoalmeida2004.workers.dev/agent/kill
 
 # Run dashboard locally
 cd dashboard && npm install && npm run dev
@@ -155,6 +168,42 @@ See `docs/harness.html` for detailed customization guide.
 | `min_analyst_confidence` | 0.6 | Minimum LLM confidence to trade |
 | `options_enabled` | false | Enable options trading |
 | `crypto_enabled` | false | Enable 24/7 crypto trading |
+| `llm_model` | gpt-4o-mini | Research model (cheap, for bulk analysis) |
+| `llm_analyst_model` | gpt-4o | Analyst model (smart, for trading decisions) |
+
+### LLM Provider Configuration
+
+MAHORAGA supports multiple LLM providers via three modes:
+
+| Mode | Description | Required Env Vars |
+|------|-------------|-------------------|
+| `openai-raw` | Direct OpenAI API (default) | `OPENAI_API_KEY` |
+| `ai-sdk` | Vercel AI SDK with 5 providers | One or more provider keys |
+| `cloudflare-gateway` | Cloudflare AI Gateway (/compat) | `CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID`, `CLOUDFLARE_AI_GATEWAY_ID`, `CLOUDFLARE_AI_GATEWAY_TOKEN` |
+
+**Cloudflare AI Gateway Notes:**
+
+- This integration calls Cloudflare's OpenAI-compatible `/compat/chat/completions` endpoint and always sends `cf-aig-authorization`.
+- It is intended for BYOK/Unified Billing setups where upstream provider keys are configured in Cloudflare (so your worker does not send provider API keys).
+- Models use the `{provider}/{model}` format (e.g. `openai/gpt-5-mini`, `google-ai-studio/gemini-2.5-flash`, `anthropic/claude-sonnet-4-5`).
+
+**AI SDK Supported Providers:**
+
+| Provider | Env Var | Example Models |
+|----------|---------|----------------|
+| OpenAI | `OPENAI_API_KEY` | `openai/gpt-4o`, `openai/o1` |
+| Anthropic | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-4`, `anthropic/claude-opus-4` |
+| Google | `GOOGLE_GENERATIVE_AI_API_KEY` | `google/gemini-2.5-pro`, `google/gemini-2.5-flash` |
+| xAI (Grok) | `XAI_API_KEY` | `xai/grok-4`, `xai/grok-3` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek/deepseek-chat`, `deepseek/deepseek-reasoner` |
+
+**Example: Using Claude with AI SDK:**
+
+```bash
+npx wrangler secret put LLM_PROVIDER      # Set to "ai-sdk"
+npx wrangler secret put LLM_MODEL         # Set to "anthropic/claude-sonnet-4"
+npx wrangler secret put ANTHROPIC_API_KEY # Your Anthropic API key
+```
 
 ## API Endpoints
 
@@ -176,7 +225,7 @@ See `docs/harness.html` for detailed customization guide.
 All `/agent/*` endpoints require Bearer token authentication using `MAHORAGA_API_TOKEN`:
 
 ```bash
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" https://your-worker.workers.dev/agent/status
+curl -H "Authorization: Bearer $MAHORAGA_TOKEN" https://mahoraga.bernardoalmeida2004.workers.dev/agent/status
 ```
 
 Generate a secure token: `openssl rand -base64 48`
@@ -186,7 +235,7 @@ Generate a secure token: `openssl rand -base64 48`
 The `/agent/kill` endpoint uses a separate `KILL_SWITCH_SECRET` for emergency shutdown:
 
 ```bash
-curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" https://your-worker.workers.dev/agent/kill
+curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" https://mahoraga.bernardoalmeida2004.workers.dev/agent/kill
 ```
 
 This immediately disables the agent, cancels all alarms, and clears the signal cache.

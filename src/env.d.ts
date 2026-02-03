@@ -9,6 +9,15 @@ export interface Env {
   ALPACA_API_SECRET: string;
   ALPACA_PAPER?: string;
   OPENAI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+  GOOGLE_GENERATIVE_AI_API_KEY?: string;
+  XAI_API_KEY?: string;
+  DEEPSEEK_API_KEY?: string;
+  CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID?: string;
+  CLOUDFLARE_AI_GATEWAY_ID?: string;
+  CLOUDFLARE_AI_GATEWAY_TOKEN?: string;
+  LLM_PROVIDER?: "openai-raw" | "ai-sdk" | "cloudflare-gateway";
+  LLM_MODEL?: string;
   TWITTER_BEARER_TOKEN?: string;
   DISCORD_WEBHOOK_URL?: string;
   COINMARKETCAP_API_KEY?: string;
@@ -28,5 +37,5 @@ export interface Env {
 }
 
 declare module "cloudflare:workers" {
-  interface Env extends Env {}
+  interface Env extends Env { }
 }

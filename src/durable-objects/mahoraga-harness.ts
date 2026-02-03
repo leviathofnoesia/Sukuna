@@ -36,7 +36,6 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import OpenAI from "openai";
 import type { Env } from "../env.d";
 import { createAlpacaProviders } from "../providers/alpaca";
 import type { Account, Position, MarketClock, Asset } from "../providers/types";
@@ -59,7 +58,7 @@ interface AgentConfig {
   // Polling intervals - how often the agent checks for new data
   data_poll_interval_ms: number;   // [TUNE] Default: 30s. Lower = more API calls
   analyst_interval_ms: number;     // [TUNE] Default: 120s. How often to run trading logic
-  
+
   // Position limits - risk management basics
   max_position_value: number;      // [TUNE] Max $ per position
   max_positions: number;           // [TUNE] Max concurrent positions
@@ -72,7 +71,7 @@ interface AgentConfig {
   take_profit_pct: number;         // [TUNE] Take profit at this % gain
   stop_loss_pct: number;           // [TUNE] Stop loss at this % loss
   position_size_pct_of_cash: number; // [TUNE] % of cash per trade
-  
+
   // Stale position management - exit positions that have lost momentum
   stale_position_enabled: boolean;
   stale_min_hold_hours: number;    // [TUNE] Min hours before checking staleness
@@ -82,12 +81,13 @@ interface AgentConfig {
   stale_mid_min_gain_pct: number;
   stale_social_volume_decay: number; // [TUNE] Exit if volume drops to this % of entry
   stale_no_mentions_hours: number;   // [TUNE] Exit if no mentions for N hours
-  
+
   // LLM configuration
+  llm_provider: 'openai-raw' | 'ai-sdk' | 'cloudflare-gateway'; // [TUNE] Provider: openai-raw, ai-sdk, cloudflare-gateway
   llm_model: string;               // [TUNE] Model for quick research (gpt-4o-mini)
   llm_analyst_model: string;       // [TUNE] Model for deep analysis (gpt-4o)
   llm_max_tokens: number;
-  
+
   // Options trading - trade options instead of shares for high-conviction plays
   options_enabled: boolean;        // [TOGGLE] Enable/disable options trading
   options_min_confidence: number;  // [TUNE] Higher threshold for options (riskier)
@@ -101,7 +101,7 @@ interface AgentConfig {
   options_stop_loss_pct: number;   // [TUNE] Options stop loss (wider than stocks)
   options_take_profit_pct: number; // [TUNE] Options take profit (higher targets)
   options_max_positions: number;
-  
+
   // Crypto trading - 24/7 momentum-based crypto trading
   crypto_enabled: boolean;         // [TOGGLE] Enable/disable crypto trading
   crypto_symbols: string[];        // [TUNE] Which cryptos to trade (BTC/USD, etc.)
@@ -125,6 +125,7 @@ interface Signal {
   freshness: number;        // Time decay factor (0-1)
   source_weight: number;    // How much to trust this source
   reason: string;           // Human-readable reason
+  timestamp: number;        // Unix timestamp (ms) when signal was gathered
   upvotes?: number;
   comments?: number;
   quality_score?: number;
@@ -284,6 +285,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   stale_mid_min_gain_pct: 3,
   stale_social_volume_decay: 0.3,
   stale_no_mentions_hours: 24,
+  llm_provider: "openai-raw",
   llm_model: "gpt-4o-mini",
   llm_analyst_model: "gpt-4o",
   llm_max_tokens: 500,
@@ -332,12 +334,25 @@ const DEFAULT_STATE: AgentState = {
   enabled: false,
 };
 
-// Blacklist for ticker extraction
+// Blacklist for ticker extraction - common English words and trading slang
 const TICKER_BLACKLIST = new Set([
-  "CEO", "CFO", "IPO", "EPS", "GDP", "SEC", "FDA", "USA", "USD", "ETF",
-  "ATH", "ATL", "IMO", "FOMO", "YOLO", "DD", "TA", "THE", "AND", "FOR",
-  "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER", "WAS", "ONE", "OUR",
-  "WSB", "RIP", "LOL", "OMG", "WTF", "FUD", "HODL", "APE", "GME", "AMC",
+  // Finance/trading terms
+  "CEO", "CFO", "COO", "CTO", "IPO", "EPS", "GDP", "SEC", "FDA", "USA", "USD", "ETF", "NYSE", "API",
+  "ATH", "ATL", "IMO", "FOMO", "YOLO", "DD", "TA", "FA", "ROI", "PE", "PB", "PS", "EV", "DCF",
+  "WSB", "RIP", "LOL", "OMG", "WTF", "FUD", "HODL", "APE", "MOASS", "DRS", "NFT", "DAO",
+  // Common English words (2-4 letters that look like tickers)
+  "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER", "WAS", "ONE", "OUR",
+  "OUT", "DAY", "HAD", "HAS", "HIS", "HOW", "ITS", "LET", "MAY", "NEW", "NOW", "OLD", "SEE",
+  "WAY", "WHO", "BOY", "DID", "GET", "HIM", "HIT", "LOW", "MAN", "RUN", "SAY", "SHE", "TOO",
+  "USE", "DAD", "MOM", "GOT", "HAS", "HAD", "LET", "PUT", "SAW", "SAT", "SET", "SIT", "TRY",
+  "THAT", "THIS", "WITH", "HAVE", "FROM", "THEY", "BEEN", "CALL", "WILL", "EACH", "MAKE",
+  "LIKE", "TIME", "JUST", "KNOW", "TAKE", "COME", "MADE", "FIND", "MORE", "LONG", "HERE",
+  "MANY", "SOME", "THAN", "THEM", "THEN", "ONLY", "OVER", "SUCH", "YEAR", "INTO", "MOST",
+  "ALSO", "BACK", "GOOD", "WELL", "EVEN", "WANT", "GIVE", "MUCH", "WORK", "FIRST", "AFTER",
+  "AS", "AT", "BE", "BY", "DO", "GO", "IF", "IN", "IS", "IT", "MY", "NO", "OF", "ON", "OR",
+  "SO", "TO", "UP", "US", "WE", "AN", "AM", "AH", "OH", "OK", "HI", "YA", "YO",
+  // More trading slang
+  "BULL", "BEAR", "CALL", "PUTS", "HOLD", "SELL", "MOON", "PUMP", "DUMP", "BAGS", "TEND",
 ]);
 
 // ============================================================================
@@ -346,6 +361,27 @@ const TICKER_BLACKLIST = new Set([
 // [CUSTOMIZABLE] These utilities calculate sentiment weights and extract tickers.
 // Modify these to change how posts are scored and filtered.
 // ============================================================================
+
+function normalizeCryptoSymbol(symbol: string): string {
+  if (symbol.includes("/")) {
+    return symbol.toUpperCase();
+  }
+  const match = symbol.toUpperCase().match(/^([A-Z]{2,5})(USD|USDT|USDC)$/);
+  if (match) {
+    return `${match[1]}/${match[2]}`;
+  }
+  return symbol;
+}
+
+function isCryptoSymbol(symbol: string, cryptoSymbols: string[]): boolean {
+  const normalizedInput = normalizeCryptoSymbol(symbol);
+  for (const configSymbol of cryptoSymbols) {
+    if (normalizeCryptoSymbol(configSymbol) === normalizedInput) {
+      return true;
+    }
+  }
+  return /^[A-Z]{2,5}\/(USD|USDT|USDC)$/.test(normalizedInput);
+}
 
 /**
  * [TUNE] Time decay - how quickly old posts lose weight
@@ -369,7 +405,7 @@ function getEngagementMultiplier(upvotes: number, comments: number): number {
       break;
     }
   }
-  
+
   let commentMultiplier = 0.9;
   const commentThresholds = Object.entries(SOURCE_CONFIG.engagement.comments)
     .sort(([a], [b]) => Number(b) - Number(a));
@@ -379,7 +415,7 @@ function getEngagementMultiplier(upvotes: number, comments: number): number {
       break;
     }
   }
-  
+
   return (upvoteMultiplier + commentMultiplier) / 2;
 }
 
@@ -394,13 +430,14 @@ function getFlairMultiplier(flair: string | null | undefined): number {
  * Current: $SYMBOL or SYMBOL followed by trading keywords
  * Add patterns for your data sources (e.g., cashtags, mentions)
  */
-function extractTickers(text: string): string[] {
+function extractTickers(text: string, customBlacklist: string[] = []): string[] {
   const matches = new Set<string>();
+  const customSet = new Set(customBlacklist.map(t => t.toUpperCase()));
   const regex = /\$([A-Z]{1,5})\b|\b([A-Z]{2,5})\b(?=\s+(?:calls?|puts?|stock|shares?|moon|rocket|yolo|buy|sell|long|short))/gi;
   let match;
   while ((match = regex.exec(text)) !== null) {
     const ticker = (match[1] || match[2] || "").toUpperCase();
-    if (ticker.length >= 2 && ticker.length <= 5 && !TICKER_BLACKLIST.has(ticker)) {
+    if (ticker.length >= 2 && ticker.length <= 5 && !TICKER_BLACKLIST.has(ticker) && !customSet.has(ticker)) {
       matches.add(ticker);
     }
   }
@@ -416,11 +453,11 @@ function detectSentiment(text: string): number {
   const lower = text.toLowerCase();
   const bullish = ["moon", "rocket", "buy", "calls", "long", "bullish", "yolo", "tendies", "gains", "diamond", "squeeze", "pump", "green", "up", "breakout", "undervalued", "accumulate"];
   const bearish = ["puts", "short", "sell", "bearish", "crash", "dump", "drill", "tank", "rip", "red", "down", "bag", "overvalued", "bubble", "avoid"];
-  
+
   let bull = 0, bear = 0;
   for (const w of bullish) if (lower.includes(w)) bull++;
   for (const w of bearish) if (lower.includes(w)) bear++;
-  
+
   const total = bull + bear;
   if (total === 0) return 0;
   return (bull - bear) / total;
@@ -435,18 +472,18 @@ function detectSentiment(text: string): number {
 
 export class MahoragaHarness extends DurableObject<Env> {
   private state: AgentState = { ...DEFAULT_STATE };
-  private _openai: OpenAI | null = null;
+  private _llm: LLMProvider | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    
-    if (env.OPENAI_API_KEY) {
-      this._openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
-      console.log("[MahoragaHarness] OpenAI initialized");
+
+    this._llm = createLLMProvider(env);
+    if (this._llm) {
+      console.log(`[MahoragaHarness] LLM Provider initialized: ${env.LLM_PROVIDER || "openai-raw"}`);
     } else {
-      console.log("[MahoragaHarness] WARNING: OPENAI_API_KEY not found - research disabled");
+      console.log("[MahoragaHarness] WARNING: No valid LLM provider configured - research disabled");
     }
-    
+
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
@@ -456,7 +493,26 @@ export class MahoragaHarness extends DurableObject<Env> {
           config: { ...DEFAULT_CONFIG, ...stored.config },
         };
       }
+      this.initializeLLM();
     });
+  }
+
+  private initializeLLM() {
+    const provider = this.state.config.llm_provider || this.env.LLM_PROVIDER || "openai-raw";
+    const model = this.state.config.llm_model || this.env.LLM_MODEL || "gpt-4o-mini";
+
+    const effectiveEnv: Env = {
+      ...this.env,
+      LLM_PROVIDER: provider as Env["LLM_PROVIDER"],
+      LLM_MODEL: model,
+    };
+
+    this._llm = createLLMProvider(effectiveEnv);
+    if (this._llm) {
+      console.log(`[MahoragaHarness] LLM Provider initialized: ${provider} (${model})`);
+    } else {
+      console.log("[MahoragaHarness] WARNING: No valid LLM provider configured");
+    }
   }
 
   // ============================================================================
@@ -477,7 +533,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     const now = Date.now();
     const RESEARCH_INTERVAL_MS = 120_000;
     const POSITION_RESEARCH_INTERVAL_MS = 300_000;
-    
+
     try {
       const alpaca = createAlpacaProviders(this.env);
       const clock = await alpaca.trading.getClock();
@@ -496,7 +552,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         });
         this.state.lastDataGatherRun = now;
       }
-      
+
       if (now - this.state.lastResearchRun >= RESEARCH_INTERVAL_MS) {
         if (shouldScanEquities) {
           await this.researchTopSignals(5);
@@ -509,18 +565,18 @@ export class MahoragaHarness extends DurableObject<Env> {
       if (isPremarket && !this.state.premarketPlan) {
         await this.runPreMarketAnalysis();
       }
-      
+
       const positions = await alpaca.trading.getPositions();
-      
+
       if (this.state.config.crypto_enabled) {
         await this.runCryptoTrading(alpaca, positions);
       }
-      
+
       if (clock.is_open) {
         if (this.isMarketJustOpened() && this.state.premarketPlan) {
           await this.executePremarketPlan();
         }
-        
+
         if (now - this.state.lastAnalystRun >= this.state.config.analyst_interval_ms) {
           await this.runAnalyst();
           this.state.lastAnalystRun = now;
@@ -554,12 +610,12 @@ export class MahoragaHarness extends DurableObject<Env> {
           }
         }
       }
-      
+
       await this.persist();
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
     }
-    
+
     await this.scheduleNextAlarm();
   }
 
@@ -631,31 +687,31 @@ export class MahoragaHarness extends DurableObject<Env> {
       switch (action) {
         case "status":
           return this.handleStatus();
-        
+
         case "setup/status":
           return this.jsonResponse({ ok: true, data: { configured: true } });
-        
+
         case "config":
           if (request.method === "POST") {
             return this.handleUpdateConfig(request);
           }
           return this.jsonResponse({ ok: true, data: this.state.config });
-        
+
         case "enable":
           return this.handleEnable();
-        
+
         case "disable":
           return this.handleDisable();
-        
+
         case "logs":
           return this.handleGetLogs(url);
-        
+
         case "costs":
           return this.jsonResponse({ costs: this.state.costTracker });
-        
+
         case "signals":
           return this.jsonResponse({ signals: this.state.signalCache });
-        
+
         case "trigger":
           await this.alarm();
           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
@@ -674,7 +730,7 @@ export class MahoragaHarness extends DurableObject<Env> {
             );
           }
           return this.handleKillSwitch();
-        
+
         default:
           return new Response("Not found", { status: 404 });
       }
@@ -688,21 +744,29 @@ export class MahoragaHarness extends DurableObject<Env> {
 
   private async handleStatus(): Promise<Response> {
     const alpaca = createAlpacaProviders(this.env);
-    
+
     let account: Account | null = null;
     let positions: Position[] = [];
     let clock: MarketClock | null = null;
-    
+
     try {
       [account, positions, clock] = await Promise.all([
         alpaca.trading.getAccount(),
         alpaca.trading.getPositions(),
         alpaca.trading.getClock(),
       ]);
+
+      for (const pos of positions || []) {
+        const entry = this.state.positionEntries[pos.symbol];
+        if (entry && entry.entry_price === 0 && pos.avg_entry_price) {
+          entry.entry_price = pos.avg_entry_price;
+          entry.peak_price = Math.max(entry.peak_price, pos.current_price);
+        }
+      }
     } catch (e) {
       // Ignore - will return null
     }
-    
+
     return this.jsonResponse({
       ok: true,
       data: {
@@ -737,6 +801,7 @@ export class MahoragaHarness extends DurableObject<Env> {
   private async handleUpdateConfig(request: Request): Promise<Response> {
     const body = await request.json() as Partial<AgentConfig>;
     this.state.config = { ...this.state.config, ...body };
+    this.initializeLLM();
     await this.persist();
     return this.jsonResponse({ ok: true, config: this.state.config });
   }
@@ -809,8 +874,8 @@ export class MahoragaHarness extends DurableObject<Env> {
     this.state.premarketPlan = null;
     await this.persist();
     this.log("System", "kill_switch_activated", { timestamp: new Date().toISOString() });
-    return this.jsonResponse({ 
-      ok: true, 
+    return this.jsonResponse({
+      ok: true,
       message: "KILL SWITCH ACTIVATED. Agent disabled, alarms cancelled, signal cache cleared.",
       note: "Existing positions are NOT automatically closed. Review and close manually if needed."
     });
@@ -963,14 +1028,14 @@ export class MahoragaHarness extends DurableObject<Env> {
   private async gatherStockTwits(): Promise<Signal[]> {
     const signals: Signal[] = [];
     const sourceWeight = SOURCE_CONFIG.weights.stocktwits;
-    
+
     try {
       // Get trending symbols
       const trendingRes = await fetch("https://api.stocktwits.com/api/2/trending/symbols.json");
       if (!trendingRes.ok) return [];
       const trendingData = await trendingRes.json() as { symbols?: Array<{ symbol: string }> };
       const trending = trendingData.symbols || [];
-      
+
       // Get sentiment for top trending
       for (const sym of trending.slice(0, 15)) {
         try {
@@ -978,7 +1043,7 @@ export class MahoragaHarness extends DurableObject<Env> {
           if (!streamRes.ok) continue;
           const streamData = await streamRes.json() as { messages?: Array<{ entities?: { sentiment?: { basic?: string } }; created_at?: string }> };
           const messages = streamData.messages || [];
-          
+
           // Analyze sentiment
           let bullish = 0, bearish = 0, totalTimeDecay = 0;
           for (const msg of messages) {
@@ -986,19 +1051,19 @@ export class MahoragaHarness extends DurableObject<Env> {
             const msgTime = new Date(msg.created_at || Date.now()).getTime() / 1000;
             const timeDecay = calculateTimeDecay(msgTime);
             totalTimeDecay += timeDecay;
-            
+
             if (sentiment === "Bullish") bullish += timeDecay;
             else if (sentiment === "Bearish") bearish += timeDecay;
           }
-          
+
           const total = messages.length;
           const effectiveTotal = totalTimeDecay || 1;
           const score = effectiveTotal > 0 ? (bullish - bearish) / effectiveTotal : 0;
           const avgFreshness = total > 0 ? totalTimeDecay / total : 0;
-          
+
           if (total >= 5) {
             const weightedSentiment = score * sourceWeight * avgFreshness;
-            
+
             signals.push({
               symbol: sym.symbol,
               source: "stocktwits",
@@ -1011,9 +1076,10 @@ export class MahoragaHarness extends DurableObject<Env> {
               freshness: avgFreshness,
               source_weight: sourceWeight,
               reason: `StockTwits: ${Math.round(bullish)}B/${Math.round(bearish)}b (${(score * 100).toFixed(0)}%) [fresh:${(avgFreshness * 100).toFixed(0)}%]`,
+              timestamp: Date.now(),
             });
           }
-          
+
           await this.sleep(200);
         } catch {
           continue;
@@ -1022,7 +1088,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     } catch (error) {
       this.log("StockTwits", "error", { message: String(error) });
     }
-    
+
     return signals;
   }
 
@@ -1043,7 +1109,7 @@ export class MahoragaHarness extends DurableObject<Env> {
 
     for (const sub of subreddits) {
       const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
-      
+
       try {
         const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, {
           headers: { "User-Agent": "Mahoraga/2.0" },
@@ -1051,17 +1117,17 @@ export class MahoragaHarness extends DurableObject<Env> {
         if (!res.ok) continue;
         const data = await res.json() as { data?: { children?: Array<{ data: { title?: string; selftext?: string; created_utc?: number; ups?: number; num_comments?: number; link_flair_text?: string } }> } };
         const posts = data.data?.children?.map(c => c.data) || [];
-        
+
         for (const post of posts) {
           const text = `${post.title || ""} ${post.selftext || ""}`;
-          const tickers = extractTickers(text);
+          const tickers = extractTickers(text, this.state.config.ticker_blacklist);
           const rawSentiment = detectSentiment(text);
-          
+
           const timeDecay = calculateTimeDecay(post.created_utc || Date.now() / 1000);
           const engagementMult = getEngagementMultiplier(post.ups || 0, post.num_comments || 0);
           const flairMult = getFlairMultiplier(post.link_flair_text);
           const qualityScore = timeDecay * engagementMult * flairMult * sourceWeight;
-          
+
           for (const ticker of tickers) {
             if (!tickerData.has(ticker)) {
               tickerData.set(ticker, {
@@ -1085,18 +1151,18 @@ export class MahoragaHarness extends DurableObject<Env> {
             d.upvotes += post.ups || 0;
             d.comments += post.num_comments || 0;
             d.sources.add(sub);
-            
+
             if (flairMult > d.bestFlairMult) {
               d.bestFlair = post.link_flair_text || null;
               d.bestFlairMult = flairMult;
             }
-            
+
             if ((post.created_utc || 0) > d.freshestPost) {
               d.freshestPost = post.created_utc || 0;
             }
           }
         }
-        
+
         await this.sleep(1000);
       } catch {
         continue;
@@ -1108,11 +1174,11 @@ export class MahoragaHarness extends DurableObject<Env> {
       if (data.mentions >= 2) {
         const avgRawSentiment = data.rawSentiment / data.mentions;
         const avgQuality = data.totalQuality / data.mentions;
-        const finalSentiment = data.totalQuality > 0 
+        const finalSentiment = data.totalQuality > 0
           ? data.weightedSentiment / data.mentions
           : avgRawSentiment * 0.5;
         const freshness = calculateTimeDecay(data.freshestPost);
-        
+
         signals.push({
           symbol,
           source: "reddit",
@@ -1128,6 +1194,7 @@ export class MahoragaHarness extends DurableObject<Env> {
           subreddits: Array.from(data.sources),
           source_weight: avgQuality,
           reason: `Reddit(${Array.from(data.sources).join(",")}): ${data.mentions} mentions, ${data.upvotes} upvotes, quality:${(avgQuality * 100).toFixed(0)}%`,
+          timestamp: Date.now(),
         });
       }
     }
@@ -1137,28 +1204,28 @@ export class MahoragaHarness extends DurableObject<Env> {
 
   private async gatherCrypto(): Promise<Signal[]> {
     if (!this.state.config.crypto_enabled) return [];
-    
+
     const signals: Signal[] = [];
     const symbols = this.getActiveCryptoSymbols();
     const alpaca = createAlpacaProviders(this.env);
-    
+
     for (const symbol of symbols) {
       try {
         const snapshot = await alpaca.marketData.getCryptoSnapshot(symbol);
         if (!snapshot) continue;
-        
+
         const price = snapshot.latest_trade?.price || 0;
         const prevClose = snapshot.prev_daily_bar?.c || 0;
-        
+
         if (!price || !prevClose) continue;
-        
+
         const momentum = ((price - prevClose) / prevClose) * 100;
         const threshold = this.state.config.crypto_momentum_threshold || 2.0;
         const hasSignificantMove = Math.abs(momentum) >= threshold;
         const isBullish = momentum > 0;
-        
+
         const rawSentiment = hasSignificantMove && isBullish ? Math.min(Math.abs(momentum) / 5, 1) : 0.1;
-        
+
         signals.push({
           symbol,
           source: "crypto",
@@ -1174,14 +1241,15 @@ export class MahoragaHarness extends DurableObject<Env> {
           isCrypto: true,
           momentum,
           price,
+          timestamp: Date.now(),
         });
-        
+
         await this.sleep(200);
       } catch (error) {
         this.log("Crypto", "error", { symbol, message: String(error) });
       }
     }
-    
+
     this.log("Crypto", "gathered_signals", { count: signals.length });
     return signals;
   }
@@ -1201,13 +1269,13 @@ export class MahoragaHarness extends DurableObject<Env> {
     
     for (const pos of cryptoPositions) {
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
-      
+
       if (plPct >= this.state.config.crypto_take_profit_pct) {
         this.log("Crypto", "take_profit", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executeSell(alpaca, pos.symbol, `Crypto take profit at +${plPct.toFixed(1)}%`);
         continue;
       }
-      
+
       if (plPct <= -this.state.config.crypto_stop_loss_pct) {
         this.log("Crypto", "stop_loss", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executeSell(alpaca, pos.symbol, `Crypto stop loss at ${plPct.toFixed(1)}%`);
@@ -1217,7 +1285,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     
     const maxCryptoPositions = Math.min(activeCryptoSymbols.length || 3, 3);
     if (cryptoPositions.length >= maxCryptoPositions) return;
-    
+
     const cryptoSignals = this.state.signalCache
       .filter(s => s.isCrypto)
       .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
@@ -1237,19 +1305,19 @@ export class MahoragaHarness extends DurableObject<Env> {
 
     for (const signal of signalsToCheck) {
       if (cryptoPositions.length >= maxCryptoPositions) break;
-      
+
       const existingResearch = this.state.signalResearch[signal.symbol];
       
       let research: ResearchResult | null = existingResearch ?? null;
       if (!existingResearch || now - existingResearch.timestamp > CRYPTO_RESEARCH_TTL_MS) {
         research = await this.researchCrypto(signal.symbol, signal.momentum || 0, signal.sentiment);
       }
-      
+
       if (!research || research.verdict !== "BUY") {
-        this.log("Crypto", "research_skip", { 
-          symbol: signal.symbol, 
+        this.log("Crypto", "research_skip", {
+          symbol: signal.symbol,
           verdict: research?.verdict || "NO_RESEARCH",
-          confidence: research?.confidence || 0 
+          confidence: research?.confidence || 0
         });
         continue;
       }
@@ -1263,7 +1331,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         });
         continue;
       }
-      
+
       const account = await alpaca.trading.getAccount();
       const resultSymbol = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
       
@@ -1274,14 +1342,14 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
     }
   }
-  
+
   private async researchCrypto(
     symbol: string,
     momentum: number,
     sentiment: number
   ): Promise<ResearchResult | null> {
-    if (!this._openai) {
-      this.log("Crypto", "skipped_no_openai", { symbol, reason: "OPENAI_API_KEY not configured" });
+    if (!this._llm) {
+      this.log("Crypto", "skipped_no_llm", { symbol, reason: "LLM Provider not configured" });
       return null;
     }
 
@@ -1314,22 +1382,23 @@ JSON response:
   "catalysts": ["positive factors"]
 }`;
 
-      const response = await this._openai.chat.completions.create({
-        model: "gpt-4o-mini",
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model, // Use config model (usually cheap one)
         messages: [
           { role: "system", content: "You are a crypto analyst. Be skeptical of FOMO. Crypto is volatile - only recommend BUY for strong setups. Output valid JSON only." },
           { role: "user", content: prompt },
         ],
         max_tokens: 250,
         temperature: 0.3,
+        response_format: { type: "json_object" }
       });
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost("gpt-4o-mini", usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
-      const content = response.choices[0]?.message?.content || "{}";
+      const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
         verdict: "BUY" | "SKIP" | "WAIT";
         confidence: number;
@@ -1376,12 +1445,12 @@ JSON response:
       account.cash * (sizePct / 100) * confidence,
       this.state.config.crypto_max_position_value
     );
-    
+
     if (positionSize < 10) {
       this.log("Crypto", "buy_skipped", { symbol, reason: "Position too small" });
       return null;
     }
-    
+
     try {
       const resolved = await this.resolveAssetClass(alpaca, symbol);
       const orderSymbol = normalizeCryptoSymbol(resolved.symbol, this.getActiveCryptoSymbols());
@@ -1418,7 +1487,7 @@ JSON response:
   private canSpendTwitterRead(): boolean {
     const ONE_DAY_MS = 86400_000;
     const MAX_DAILY_READS = 200;
-    
+
     const now = Date.now();
     if (now - this.state.twitterDailyReadReset > ONE_DAY_MS) {
       this.state.twitterDailyReads = 0;
@@ -1508,7 +1577,7 @@ JSON response:
   private async gatherTwitterConfirmation(symbol: string, existingSentiment: number): Promise<TwitterConfirmation | null> {
     const MIN_SENTIMENT_FOR_CONFIRMATION = 0.3;
     const CACHE_TTL_MS = 300_000;
-    
+
     if (!this.isTwitterEnabled() || !this.canSpendTwitterRead()) return null;
     if (Math.abs(existingSentiment) < MIN_SENTIMENT_FOR_CONFIRMATION) return null;
 
@@ -1531,15 +1600,15 @@ JSON response:
 
     for (const tweet of tweets) {
       const text = tweet.text.toLowerCase();
-      
+
       const authorWeight = Math.min(1.5, Math.log10(tweet.author_followers + 1) / 5);
       const engagementWeight = Math.min(1.3, 1 + (tweet.likes + tweet.retweets * 2) / 1000);
       const weight = authorWeight * engagementWeight;
-      
+
       let sentiment = 0;
       for (const w of bullWords) if (text.includes(w)) sentiment += 1;
       for (const w of bearWords) if (text.includes(w)) sentiment -= 1;
-      
+
       if (sentiment > 0) bullish += weight;
       else if (sentiment < 0) bearish += weight;
       totalWeight += weight;
@@ -1601,7 +1670,7 @@ JSON response:
 
     const MAX_NEWS_AGE_MS = 1800_000;
     const BREAKING_THRESHOLD_MS = 600_000;
-    
+
     for (const tweet of tweets) {
       const tweetAge = Date.now() - new Date(tweet.created_at).getTime();
       if (tweetAge > MAX_NEWS_AGE_MS) continue;
@@ -1651,8 +1720,8 @@ JSON response:
     sources: string[],
     priceHint?: number
   ): Promise<ResearchResult | null> {
-    if (!this._openai) {
-      this.log("SignalResearch", "skipped_no_openai", { symbol, reason: "OPENAI_API_KEY not configured" });
+    if (!this._llm) {
+      this.log("SignalResearch", "skipped_no_llm", { symbol, reason: "LLM Provider not configured" });
       return null;
     }
 
@@ -1720,22 +1789,23 @@ JSON response:
   "catalysts": ["positive factors"]
 }`;
 
-      const response = await this._openai.chat.completions.create({
-        model: "gpt-4o-mini",
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model,
         messages: [
           { role: "system", content: "You are a stock research analyst. Be skeptical of hype. Output valid JSON only." },
           { role: "user", content: prompt },
         ],
         max_tokens: 250,
         temperature: 0.3,
+        response_format: { type: "json_object" }
       });
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost("gpt-4o-mini", usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
-      const content = response.choices[0]?.message?.content || "{}";
+      const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
         verdict: "BUY" | "SKIP" | "WAIT";
         confidence: number;
@@ -1840,13 +1910,16 @@ JSON response:
     return results;
   }
 
-  private async researchPosition(symbol: string, position: Position): Promise<{
-    recommendation: "HOLD" | "SELL" | "ADD";
+  private async researchPosition(
+    symbol: string,
+    position: Position
+  ): Promise<{
+    recommendation: "SELL" | "HOLD" | "ADD";
     risk_level: "low" | "medium" | "high";
     reasoning: string;
     key_factors: string[];
   } | null> {
-    if (!this._openai) return null;
+    if (!this._llm) return null;
 
     const plPct = (position.unrealized_pl / (position.market_value - position.unrealized_pl)) * 100;
 
@@ -1867,22 +1940,23 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
 }`;
 
     try {
-      const response = await this._openai.chat.completions.create({
-        model: "gpt-4o-mini",
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model,
         messages: [
           { role: "system", content: "You are a position risk analyst. Be concise. Output valid JSON only." },
           { role: "user", content: prompt },
         ],
         max_tokens: 200,
         temperature: 0.3,
+        response_format: { type: "json_object" }
       });
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost("gpt-4o-mini", usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
-      const content = response.choices[0]?.message?.content || "{}";
+      const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
         recommendation: "HOLD" | "SELL" | "ADD";
         risk_level: "low" | "medium" | "high";
@@ -1919,7 +1993,7 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     market_summary: string;
     high_conviction: string[];
   }> {
-    if (!this._openai || signals.length === 0) {
+    if (!this._llm || signals.length === 0) {
       return { recommendations: [], market_summary: "No signals to analyze", high_conviction: [] };
     }
 
@@ -1954,18 +2028,18 @@ ACCOUNT STATUS:
 
 CURRENT POSITIONS:
 ${positions.length === 0 ? "None" : positions.map(p =>
-  `- ${p.symbol}: ${p.qty} shares, P&L: $${p.unrealized_pl.toFixed(2)} (${((p.unrealized_pl / (p.market_value - p.unrealized_pl)) * 100).toFixed(1)}%)`
-).join("\n")}
+      `- ${p.symbol}: ${p.qty} shares, P&L: $${p.unrealized_pl.toFixed(2)} (${((p.unrealized_pl / (p.market_value - p.unrealized_pl)) * 100).toFixed(1)}%)`
+    ).join("\n")}
 
 TOP SENTIMENT CANDIDATES:
 ${candidates.map(c =>
-  `- ${c.symbol}: avg sentiment ${(c.avgSentiment * 100).toFixed(0)}%, sources: ${c.sources.join(", ")}, ${positionSymbols.has(c.symbol) ? "[CURRENTLY HELD]" : "[NOT HELD]"}`
-).join("\n")}
+      `- ${c.symbol}: avg sentiment ${(c.avgSentiment * 100).toFixed(0)}%, sources: ${c.sources.join(", ")}, ${positionSymbols.has(c.symbol) ? "[CURRENTLY HELD]" : "[NOT HELD]"}`
+    ).join("\n")}
 
 RAW SIGNALS (top 20):
 ${signals.slice(0, 20).map(s =>
-  `- ${s.symbol} (${s.source}): ${s.reason}`
-).join("\n")}
+      `- ${s.symbol} (${s.source}): ${s.reason}`
+    ).join("\n")}
 
 TRADING RULES:
 - Max position size: $${this.state.config.max_position_value}
@@ -1976,7 +2050,7 @@ TRADING RULES:
 Analyze and provide BUY/SELL/HOLD recommendations:`;
 
     try {
-      const response = await this._openai.chat.completions.create({
+      const response = await this._llm.complete({
         model: this.state.config.llm_analyst_model,
         messages: [
           {
@@ -2002,6 +2076,7 @@ Response format:
         ],
         max_tokens: 800,
         temperature: 0.4,
+        response_format: { type: "json_object" }
       });
 
       const usage = response.usage;
@@ -2009,7 +2084,7 @@ Response format:
         this.trackLLMCost(this.state.config.llm_analyst_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
-      const content = response.choices[0]?.message?.content || "{}";
+      const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
         recommendations: Array<{
           action: "BUY" | "SELL" | "HOLD";
@@ -2053,49 +2128,49 @@ Response format:
 
   private async runAnalyst(): Promise<void> {
     const alpaca = createAlpacaProviders(this.env);
-    
+
     const [account, positions, clock] = await Promise.all([
       alpaca.trading.getAccount(),
       alpaca.trading.getPositions(),
       alpaca.trading.getClock(),
     ]);
-    
+
     if (!account || !clock.is_open) {
       this.log("System", "analyst_skipped", { reason: "Account unavailable or market closed" });
       return;
     }
-    
+
     const heldSymbols = new Set(positions.map(p => p.symbol));
-    
+
     // Check position exits
     for (const pos of positions) {
       if (pos.asset_class === "us_option") continue;  // Options handled separately
-      
+
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
-      
+
       // Take profit
       if (plPct >= this.state.config.take_profit_pct) {
         await this.executeSell(alpaca, pos.symbol, `Take profit at +${plPct.toFixed(1)}%`);
         continue;
       }
-      
+
       // Stop loss
       if (plPct <= -this.state.config.stop_loss_pct) {
         await this.executeSell(alpaca, pos.symbol, `Stop loss at ${plPct.toFixed(1)}%`);
         continue;
       }
-      
+
       // Check staleness
       if (this.state.config.stale_position_enabled) {
         const stalenessResult = this.analyzeStaleness(pos.symbol, pos.current_price, 0);
         this.state.stalenessAnalysis[pos.symbol] = stalenessResult;
-        
+
         if (stalenessResult.isStale) {
           await this.executeSell(alpaca, pos.symbol, `STALE: ${stalenessResult.reason}`);
         }
       }
     }
-    
+
     if (positions.length < this.state.config.max_positions && this.state.signalCache.length > 0) {
       const researchedBuys = Object.values(this.state.signalResearch)
         .filter(r => r.verdict === "BUY" && r.confidence >= this.state.config.min_analyst_confidence)
@@ -2152,13 +2227,23 @@ Response format:
         }
       }
 
-      if (positions.length < this.state.config.max_positions) {
-        const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
-        const researchedSymbols = new Set(researchedBuys.map(r => r.symbol));
+      const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
+      const researchedSymbols = new Set(researchedBuys.map(r => r.symbol));
 
-        for (const rec of analysis.recommendations) {
-          if (positions.length >= this.state.config.max_positions) break;
-          if (rec.action !== "BUY" || rec.confidence < this.state.config.min_analyst_confidence) continue;
+      for (const rec of analysis.recommendations) {
+        if (rec.confidence < this.state.config.min_analyst_confidence) continue;
+
+        if (rec.action === "SELL" && heldSymbols.has(rec.symbol)) {
+          const result = await this.executeSell(alpaca, rec.symbol, `LLM recommendation: ${rec.reasoning}`);
+          if (result) {
+            heldSymbols.delete(rec.symbol);
+            this.log("Analyst", "llm_sell_executed", { symbol: rec.symbol, confidence: rec.confidence, reasoning: rec.reasoning });
+          }
+          continue;
+        }
+
+        if (rec.action === "BUY") {
+          if (positions.length >= this.state.config.max_positions) continue;
           if (heldSymbols.has(rec.symbol)) continue;
           if (researchedSymbols.has(rec.symbol)) continue;
 
@@ -2395,12 +2480,23 @@ Response format:
       account.cash * (sizePct / 100) * confidence,
       this.state.config.max_position_value
     );
-    
+
     if (positionSize < 100) {
       this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
       return null;
     }
-    
+
+    const maxAllowed = this.state.config.max_position_value * 1.01;
+    if (positionSize <= 0 || positionSize > maxAllowed || !Number.isFinite(positionSize)) {
+      this.log("Executor", "buy_blocked", {
+        symbol,
+        reason: "INVARIANT: Invalid position size",
+        positionSize,
+        maxAllowed,
+      });
+      return false;
+    }
+
     try {
       const resolved = await this.resolveAssetClass(alpaca, symbol);
       const orderSymbol = resolved.symbol;
@@ -2425,15 +2521,24 @@ Response format:
     symbol: string,
     reason: string
   ): Promise<boolean> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { reason: "INVARIANT: Empty symbol" });
+      return false;
+    }
+
+    if (!reason || reason.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { symbol, reason: "INVARIANT: No sell reason provided" });
+      return false;
+    }
+
     try {
       await alpaca.trading.closePosition(symbol);
       this.log("Executor", "sell_executed", { symbol, reason });
-      
-      // Clean up tracking
+
       delete this.state.positionEntries[symbol];
       delete this.state.socialHistory[symbol];
       delete this.state.stalenessAnalysis[symbol];
-      
+
       return true;
     } catch (error) {
       this.log("Executor", "sell_failed", { symbol, error: String(error) });
@@ -2496,8 +2601,8 @@ Response format:
 
     const holdHours = (Date.now() - entry.entry_time) / (1000 * 60 * 60);
     const holdDays = holdHours / 24;
-    const pnlPct = entry.entry_price > 0 
-      ? ((currentPrice - entry.entry_price) / entry.entry_price) * 100 
+    const pnlPct = entry.entry_price > 0
+      ? ((currentPrice - entry.entry_price) / entry.entry_price) * 100
       : 0;
 
     if (holdHours < this.state.config.stale_min_hold_hours) {
@@ -2510,7 +2615,7 @@ Response format:
     if (holdDays >= this.state.config.stale_max_hold_days) {
       stalenessScore += 40;
     } else if (holdDays >= this.state.config.stale_mid_hold_days) {
-      stalenessScore += 20 * (holdDays - this.state.config.stale_mid_hold_days) / 
+      stalenessScore += 20 * (holdDays - this.state.config.stale_mid_hold_days) /
         (this.state.config.stale_max_hold_days - this.state.config.stale_mid_hold_days);
     }
 
@@ -2522,8 +2627,8 @@ Response format:
     }
 
     // Social volume decay (max 30 points)
-    const volumeRatio = entry.entry_social_volume > 0 
-      ? currentSocialVolume / entry.entry_social_volume 
+    const volumeRatio = entry.entry_social_volume > 0
+      ? currentSocialVolume / entry.entry_social_volume
       : 1;
     if (volumeRatio <= this.state.config.stale_social_volume_decay) {
       stalenessScore += 30;
@@ -2532,13 +2637,13 @@ Response format:
     }
 
     stalenessScore = Math.min(100, stalenessScore);
-    
-    const isStale = stalenessScore >= 70 || 
+
+    const isStale = stalenessScore >= 70 ||
       (holdDays >= this.state.config.stale_max_hold_days && pnlPct < this.state.config.stale_min_gain_pct);
 
     return {
       isStale,
-      reason: isStale 
+      reason: isStale
         ? `Staleness score ${stalenessScore}/100, held ${holdDays.toFixed(1)} days`
         : `OK (score ${stalenessScore}/100)`,
       staleness_score: stalenessScore,
@@ -2577,7 +2682,7 @@ Response format:
     try {
       const alpaca = createAlpacaProviders(this.env);
       const expirations = await alpaca.options.getExpirations(symbol);
-      
+
       if (!expirations || expirations.length === 0) {
         this.log("Options", "no_expirations", { symbol });
         return null;
@@ -2840,7 +2945,7 @@ Response format:
 
   private async executePremarketPlan(): Promise<void> {
     const PLAN_STALE_MS = 600_000;
-    
+
     if (!this.state.premarketPlan || Date.now() - this.state.premarketPlan.timestamp > PLAN_STALE_MS) {
       this.log("System", "no_premarket_plan", { reason: "Plan missing or stale" });
       return;
@@ -2909,12 +3014,12 @@ Response format:
       ...details,
     };
     this.state.logs.push(entry);
-    
+
     // Keep last 500 logs
     if (this.state.logs.length > 500) {
       this.state.logs = this.state.logs.slice(-500);
     }
-    
+
     // Log to console for wrangler tail
     console.log(`[${entry.timestamp}] [${agent}] ${action}`, JSON.stringify(details));
   }
@@ -2924,15 +3029,15 @@ Response format:
       "gpt-4o": { input: 2.5, output: 10 },
       "gpt-4o-mini": { input: 0.15, output: 0.6 },
     };
-    
+
     const rates = pricing[model] ?? pricing["gpt-4o"]!;
     const cost = (tokensIn * rates.input + tokensOut * rates.output) / 1_000_000;
-    
+
     this.state.costTracker.total_usd += cost;
     this.state.costTracker.calls++;
     this.state.costTracker.tokens_in += tokensIn;
     this.state.costTracker.tokens_out += tokensOut;
-    
+
     return cost;
   }
 
@@ -2950,8 +3055,8 @@ Response format:
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  get openai(): OpenAI | null {
-    return this._openai;
+  get llm(): LLMProvider | null {
+    return this._llm;
   }
 
   private discordCooldowns: Map<string, number> = new Map();

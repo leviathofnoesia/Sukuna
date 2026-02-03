@@ -71,10 +71,10 @@ export function LineChart({
   })
 
   return (
-    <svg 
-      width="100%" 
-      height="100%" 
-      viewBox={`0 0 ${viewBoxWidth} ${viewBoxHeight}`} 
+    <svg
+      width="100%"
+      height="100%"
+      viewBox={`0 0 ${viewBoxWidth} ${viewBoxHeight}`}
       preserveAspectRatio="xMidYMid meet"
       className="block"
     >
@@ -133,7 +133,7 @@ export function LineChart({
         const colors = variantColors[s.variant ?? variant]
         const points = s.data.map((value, i) => ({ x: getX(i), y: getY(value) }))
         if (points.length === 0) return null
-        
+
         const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.y}`).join(' ')
         const areaD = `${pathD} L ${points[points.length - 1]?.x ?? 0} ${padding.top + chartHeight} L ${points[0]?.x ?? 0} ${padding.top + chartHeight} Z`
 
@@ -147,7 +147,7 @@ export function LineChart({
                 </linearGradient>
               </defs>
             )}
-            
+
             {showArea && (
               <motion.path
                 d={areaD}
@@ -205,10 +205,9 @@ export function Sparkline({
   data,
   width = 80,
   height = 24,
-  variant = 'cyan',
 }: SparklineProps) {
   if (data.length < 2) return null
-  
+
   const padding = 2
   const chartWidth = width - padding * 2
   const chartHeight = height - padding * 2
@@ -224,7 +223,6 @@ export function Sparkline({
 
   const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
   const isPositive = data[data.length - 1] >= data[0]
-  const colors = variantColors[variant] || (isPositive ? variantColors.green : variantColors.red)
 
   return (
     <svg width={width} height={height}>

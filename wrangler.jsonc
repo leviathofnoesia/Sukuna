@@ -21,9 +21,21 @@
 	// Required:
 	// - ALPACA_API_KEY
 	// - ALPACA_API_SECRET
-	// - OPENAI_API_KEY
 	// - MAHORAGA_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
 	// - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
+	// 
+	// LLM Provider (choose one mode):
+	// - LLM_PROVIDER ("openai-raw" | "ai-sdk" | "vercel-gateway", default: "openai-raw")
+	// - LLM_MODEL (model identifier, e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4")
+	//
+	// Provider API Keys (based on LLM_PROVIDER mode):
+	// - OPENAI_API_KEY (for openai-raw, or ai-sdk with OpenAI models)
+	// - ANTHROPIC_API_KEY (for ai-sdk with Anthropic models)
+	// - GOOGLE_GENERATIVE_AI_API_KEY (for ai-sdk with Google models)
+	// - XAI_API_KEY (for ai-sdk with xAI/Grok models)
+	// - DEEPSEEK_API_KEY (for ai-sdk with DeepSeek models)
+	// - AI_GATEWAY_API_KEY (for vercel-gateway unified access)
+	//
 	// Optional:
 	// - ALPACA_PAPER ("true" for paper trading)
 	// - TWITTER_BEARER_TOKEN
