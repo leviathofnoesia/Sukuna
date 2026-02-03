@@ -1637,8 +1637,6 @@ export class MahoragaHarness extends DurableObject<Env> {
       return;
     }
 
-    const account = await alpaca.trading.getAccount();
-
     for (const signal of cryptoSignals) {
       if (cryptoPositions.length >= maxCryptoPositions) break;
 
@@ -1648,7 +1646,34 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
 
-      const confidence = this.computeAlphaConfidence(alphaEntry.alpha);
+      const alphaConfidence = this.computeAlphaConfidence(alphaEntry.alpha);
+      const research = await this.researchCryptoAlpha(signal, alphaEntry, alphaConfidence);
+      if (research && research.verdict !== "BUY") {
+        this.log("Crypto", "research_skip", {
+          symbol: signal.symbol,
+          reason: "llm_veto",
+          verdict: research.verdict,
+          confidence: research.confidence,
+        });
+        continue;
+      }
+
+      const confidence = research
+        ? this.clampProbability((alphaConfidence * 0.6) + (research.confidence * 0.4))
+        : alphaConfidence;
+
+      const cryptoMinConfidence = this.state.config.crypto_min_analyst_confidence ?? this.state.config.min_analyst_confidence;
+      if (confidence < cryptoMinConfidence) {
+        this.log("Crypto", "research_skip", {
+          reason: "below_threshold",
+          symbol: signal.symbol,
+          confidence,
+          required: cryptoMinConfidence,
+        });
+        continue;
+      }
+
+      const account = await alpaca.trading.getAccount();
       const resultSymbol = await this.executeCryptoBuy(alpaca, signal.symbol, confidence, account);
 
       if (resultSymbol) {
@@ -1663,7 +1688,97 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
     }
   }
-  
+
+  private async researchCryptoAlpha(
+    signal: Signal,
+    alpha: AlphaMarket,
+    alphaConfidence: number
+  ): Promise<ResearchResult | null> {
+    if (!this._openai) {
+      this.log("Crypto", "skipped_no_openai", { symbol: signal.symbol, reason: "OPENAI_API_KEY not configured" });
+      return null;
+    }
+
+    const prompt = `You are reviewing a crypto trade candidate that already passed strict alpha filters.
+
+SYMBOL: ${signal.symbol}
+MOMENTUM (24h): ${(signal.momentum ?? 0).toFixed(2)}%
+SENTIMENT: ${(signal.sentiment * 100).toFixed(0)}% bullish
+ALPHA SCORE: ${alpha.alpha.toFixed(3)}
+IMPLIED PROB: ${alpha.implied_prob.toFixed(3)}
+CALCULATED PROB: ${alpha.calculated_prob.toFixed(3)}
+NOTIONAL VOLUME: $${alpha.notional_volume.toFixed(0)}
+SPREAD %: ${alpha.spread_pct !== null ? (alpha.spread_pct * 100).toFixed(2) : "N/A"}
+
+Guidance:
+- This candidate already passed volume + liquidity + edge filters.
+- Only return SKIP if you see a *clear* red flag.
+- Otherwise return BUY with confidence scaled to alpha strength.
+
+Return JSON only:
+{
+  "verdict": "BUY|SKIP|WAIT",
+  "confidence": 0.0-1.0,
+  "entry_quality": "excellent|good|fair|poor",
+  "reasoning": "brief reason",
+  "red_flags": ["any concerns"],
+  "catalysts": ["positive factors"]
+}`;
+
+    try {
+      const response = await this._openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are a disciplined crypto analyst. Favor BUY when alpha filters are strong unless clear risks exist. Output valid JSON only." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 250,
+        temperature: 0.2,
+      });
+
+      const usage = response.usage;
+      if (usage) {
+        this.trackLLMCost("gpt-4o-mini", usage.prompt_tokens, usage.completion_tokens);
+      }
+
+      const content = response.choices[0]?.message?.content || "{}";
+      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
+        verdict: "BUY" | "SKIP" | "WAIT";
+        confidence: number;
+        entry_quality: "excellent" | "good" | "fair" | "poor";
+        reasoning: string;
+        red_flags: string[];
+        catalysts: string[];
+      };
+
+      const result: ResearchResult = {
+        symbol: signal.symbol,
+        verdict: analysis.verdict,
+        confidence: this.clampProbability(analysis.confidence),
+        entry_quality: analysis.entry_quality,
+        reasoning: analysis.reasoning,
+        red_flags: analysis.red_flags || [],
+        catalysts: analysis.catalysts || [],
+        timestamp: Date.now(),
+      };
+
+      this.state.signalResearch[signal.symbol] = result;
+      this.log("Crypto", "researched", {
+        symbol: signal.symbol,
+        verdict: result.verdict,
+        confidence: result.confidence,
+        quality: result.entry_quality,
+        alpha: Number(alpha.alpha.toFixed(4)),
+        alpha_confidence: Number(alphaConfidence.toFixed(3)),
+      });
+
+      return result;
+    } catch (error) {
+      this.log("Crypto", "research_error", { symbol: signal.symbol, error: String(error) });
+      return null;
+    }
+  }
+
   private async executeCryptoBuy(
     alpaca: ReturnType<typeof createAlpacaProviders>,
     symbol: string,
