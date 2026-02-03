@@ -109,6 +109,9 @@ interface AgentConfig {
   crypto_max_position_value: number;
   crypto_take_profit_pct: number;
   crypto_stop_loss_pct: number;
+  crypto_min_analyst_confidence: number; // [TUNE] Lower threshold for crypto-only trades
+  crypto_universe_top_n: number;   // [TUNE] Use CoinMarketCap top-N (0 disables)
+  crypto_universe_refresh_ms: number; // [TUNE] Refresh cadence for top-N universe
 }
 
 // [CUSTOMIZABLE] Add fields here when you add new data sources
@@ -217,6 +220,8 @@ interface AgentState {
   twitterDailyReads: number;
   twitterDailyReadReset: number;
   premarketPlan: PremarketPlan | null;
+  cryptoUniverseSymbols: string[];
+  cryptoUniverseUpdatedAt: number;
   enabled: boolean;
 }
 
@@ -300,6 +305,9 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_max_position_value: 1000,
   crypto_take_profit_pct: 10,
   crypto_stop_loss_pct: 5,
+  crypto_min_analyst_confidence: 0.5,
+  crypto_universe_top_n: 100,
+  crypto_universe_refresh_ms: 300_000,
 };
 
 const DEFAULT_STATE: AgentState = {
@@ -319,6 +327,8 @@ const DEFAULT_STATE: AgentState = {
   twitterDailyReads: 0,
   twitterDailyReadReset: 0,
   premarketPlan: null,
+  cryptoUniverseSymbols: [],
+  cryptoUniverseUpdatedAt: 0,
   enabled: false,
 };
 
@@ -440,7 +450,11 @@ export class MahoragaHarness extends DurableObject<Env> {
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
-        this.state = { ...DEFAULT_STATE, ...stored };
+        this.state = {
+          ...DEFAULT_STATE,
+          ...stored,
+          config: { ...DEFAULT_CONFIG, ...stored.config },
+        };
       }
     });
   }
@@ -467,18 +481,32 @@ export class MahoragaHarness extends DurableObject<Env> {
     try {
       const alpaca = createAlpacaProviders(this.env);
       const clock = await alpaca.trading.getClock();
+      const isPremarket = this.isPreMarketWindow();
+      const shouldScanEquities = clock.is_open || isPremarket;
+      const shouldScanCrypto = this.state.config.crypto_enabled;
       
+      if (shouldScanCrypto) {
+        await this.refreshCryptoUniverse(alpaca);
+      }
+
       if (now - this.state.lastDataGatherRun >= this.state.config.data_poll_interval_ms) {
-        await this.runDataGatherers();
+        await this.runDataGatherers({
+          scanEquities: shouldScanEquities,
+          scanCrypto: shouldScanCrypto,
+        });
         this.state.lastDataGatherRun = now;
       }
       
       if (now - this.state.lastResearchRun >= RESEARCH_INTERVAL_MS) {
-        await this.researchTopSignals(5);
+        if (shouldScanEquities) {
+          await this.researchTopSignals(5);
+        } else {
+          this.log("SignalResearch", "skipped_market_closed", { reason: "Equities market closed" });
+        }
         this.state.lastResearchRun = now;
       }
       
-      if (this.isPreMarketWindow() && !this.state.premarketPlan) {
+      if (isPremarket && !this.state.premarketPlan) {
         await this.runPreMarketAnalysis();
       }
       
@@ -694,6 +722,14 @@ export class MahoragaHarness extends DurableObject<Env> {
         twitterConfirmations: this.state.twitterConfirmations,
         premarketPlan: this.state.premarketPlan,
         stalenessAnalysis: this.state.stalenessAnalysis,
+        cryptoUniverse: {
+          provider: this.env.COINMARKETCAP_API_KEY ? "coinmarketcap" : "coinpaprika",
+          enabled: this.state.config.crypto_enabled && (this.state.config.crypto_universe_top_n ?? 0) > 0,
+          top_n: this.state.config.crypto_universe_top_n ?? 0,
+          refresh_ms: this.state.config.crypto_universe_refresh_ms ?? 0,
+          last_updated_at: this.state.cryptoUniverseUpdatedAt,
+          size: this.state.cryptoUniverseSymbols.length,
+        },
       },
     });
   }
@@ -794,15 +830,27 @@ export class MahoragaHarness extends DurableObject<Env> {
   // Each gatherer returns Signal[] which get merged into signalCache.
   // ============================================================================
 
-  private async runDataGatherers(): Promise<void> {
-    this.log("System", "gathering_data", {});
-    
-    const [stocktwitsSignals, redditSignals, cryptoSignals] = await Promise.all([
-      this.gatherStockTwits(),
-      this.gatherReddit(),
-      this.gatherCrypto(),
-    ]);
-    
+  private async runDataGatherers(options: { scanEquities: boolean; scanCrypto: boolean }): Promise<void> {
+    this.log("System", "gathering_data", {
+      scan_equities: options.scanEquities,
+      scan_crypto: options.scanCrypto,
+    });
+
+    let stocktwitsSignals: Signal[] = [];
+    let redditSignals: Signal[] = [];
+    let cryptoSignals: Signal[] = [];
+
+    if (options.scanEquities) {
+      [stocktwitsSignals, redditSignals] = await Promise.all([
+        this.gatherStockTwits(),
+        this.gatherReddit(),
+      ]);
+    }
+
+    if (options.scanCrypto) {
+      cryptoSignals = await this.gatherCrypto();
+    }
+
     const mergedSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals];
     const filteredSignals = await this.prefilterSignals(mergedSignals);
     this.state.signalCache = filteredSignals;
@@ -829,15 +877,48 @@ export class MahoragaHarness extends DurableObject<Env> {
 
     const alpaca = createAlpacaProviders(this.env);
     const allowlist = this.getExchangeAllowlist();
+    const activeCryptoSymbols = this.getActiveCryptoSymbols();
+    const cryptoAllowlist = new Set<string>();
+    for (const symbol of activeCryptoSymbols) {
+      const normalized = normalizeSymbol(symbol);
+      cryptoAllowlist.add(cryptoSymbolKey(normalized));
+      cryptoAllowlist.add(this.getCryptoBaseSymbol(normalized));
+    }
     const decisions = new Map<string, { allowed: boolean; symbol: string; isCrypto: boolean }>();
     const filtered: Signal[] = [];
 
     for (const signal of signals) {
       const cacheKey = cryptoSymbolKey(signal.symbol);
+      const baseKey = this.getCryptoBaseSymbol(signal.symbol);
       let decision = decisions.get(cacheKey);
+
+      if (cryptoAllowlist.has(cacheKey) || cryptoAllowlist.has(baseKey)) {
+        filtered.push({
+          ...signal,
+          symbol: normalizeCryptoSymbol(signal.symbol, activeCryptoSymbols),
+          isCrypto: true,
+        });
+        continue;
+      }
+
+      if (signal.isCrypto) {
+        this.log("SignalFilter", "crypto_not_allowed", { symbol: signal.symbol });
+        continue;
+      }
 
       if (!decision) {
         const resolved = await this.resolveAssetClass(alpaca, signal.symbol);
+
+        if (resolved.isCrypto) {
+          const resolvedKey = cryptoSymbolKey(normalizeCryptoSymbol(resolved.symbol, activeCryptoSymbols));
+          const resolvedBase = this.getCryptoBaseSymbol(resolved.symbol);
+          if (!cryptoAllowlist.has(resolvedKey) && !cryptoAllowlist.has(resolvedBase)) {
+            this.log("SignalFilter", "crypto_not_allowed", { symbol: resolved.symbol });
+            decision = { allowed: false, symbol: resolved.symbol, isCrypto: true };
+            decisions.set(cacheKey, decision);
+            continue;
+          }
+        }
 
         if (!resolved.asset) {
           this.log("SignalFilter", "asset_unavailable", { symbol: resolved.symbol });
@@ -849,7 +930,7 @@ export class MahoragaHarness extends DurableObject<Env> {
             status: resolved.asset.status,
           });
           decision = { allowed: false, symbol: resolved.symbol, isCrypto: resolved.isCrypto };
-        } else if (allowlist && !allowlist.has(resolved.asset.exchange.toUpperCase())) {
+        } else if (allowlist && !resolved.isCrypto && !allowlist.has(resolved.asset.exchange.toUpperCase())) {
           this.log("SignalFilter", "asset_exchange_blocked", {
             symbol: resolved.symbol,
             exchange: resolved.asset.exchange,
@@ -1058,7 +1139,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     if (!this.state.config.crypto_enabled) return [];
     
     const signals: Signal[] = [];
-    const symbols = this.state.config.crypto_symbols || ["BTC/USD", "ETH/USD", "SOL/USD"];
+    const symbols = this.getActiveCryptoSymbols();
     const alpaca = createAlpacaProviders(this.env);
     
     for (const symbol of symbols) {
@@ -1111,9 +1192,10 @@ export class MahoragaHarness extends DurableObject<Env> {
   ): Promise<void> {
     if (!this.state.config.crypto_enabled) return;
     
-    const cryptoSymbolKeys = new Set((this.state.config.crypto_symbols ?? []).map(cryptoSymbolKey));
+    const activeCryptoSymbols = this.getActiveCryptoSymbols();
+    const cryptoSymbolKeys = new Set(activeCryptoSymbols.map(cryptoSymbolKey));
     const cryptoPositions = positions.filter(p =>
-      cryptoSymbolKeys.has(cryptoSymbolKey(p.symbol)) || p.symbol.includes("/")
+      p.asset_class === "crypto" || cryptoSymbolKeys.has(cryptoSymbolKey(p.symbol)) || p.symbol.includes("/")
     );
     const heldCrypto = new Set(cryptoPositions.map(p => cryptoSymbolKey(p.symbol)));
     
@@ -1133,7 +1215,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
     }
     
-    const maxCryptoPositions = Math.min(this.state.config.crypto_symbols?.length || 3, 3);
+    const maxCryptoPositions = Math.min(activeCryptoSymbols.length || 3, 3);
     if (cryptoPositions.length >= maxCryptoPositions) return;
     
     const cryptoSignals = this.state.signalCache
@@ -1142,14 +1224,24 @@ export class MahoragaHarness extends DurableObject<Env> {
       .filter(s => s.sentiment > 0)
       .sort((a, b) => (b.momentum || 0) - (a.momentum || 0));
     
-    for (const signal of cryptoSignals.slice(0, 2)) {
+    const now = Date.now();
+    const CRYPTO_RESEARCH_TTL_MS = 300_000;
+    const CRYPTO_RESEARCH_COOLDOWN_MS = 600_000;
+
+    const candidateSignals = cryptoSignals.filter((signal) => {
+      const existing = this.state.signalResearch[signal.symbol];
+      return !existing || now - existing.timestamp > CRYPTO_RESEARCH_COOLDOWN_MS;
+    });
+
+    const signalsToCheck = (candidateSignals.length > 0 ? candidateSignals : cryptoSignals).slice(0, 4);
+
+    for (const signal of signalsToCheck) {
       if (cryptoPositions.length >= maxCryptoPositions) break;
       
       const existingResearch = this.state.signalResearch[signal.symbol];
-      const CRYPTO_RESEARCH_TTL_MS = 300_000;
       
       let research: ResearchResult | null = existingResearch ?? null;
-      if (!existingResearch || Date.now() - existingResearch.timestamp > CRYPTO_RESEARCH_TTL_MS) {
+      if (!existingResearch || now - existingResearch.timestamp > CRYPTO_RESEARCH_TTL_MS) {
         research = await this.researchCrypto(signal.symbol, signal.momentum || 0, signal.sentiment);
       }
       
@@ -1162,8 +1254,13 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
       
-      if (research.confidence < this.state.config.min_analyst_confidence) {
-        this.log("Crypto", "low_confidence", { symbol: signal.symbol, confidence: research.confidence });
+      const cryptoMinConfidence = this.state.config.crypto_min_analyst_confidence ?? this.state.config.min_analyst_confidence;
+      if (research.confidence < cryptoMinConfidence) {
+        this.log("Crypto", "low_confidence", {
+          symbol: signal.symbol,
+          confidence: research.confidence,
+          required: cryptoMinConfidence,
+        });
         continue;
       }
       
@@ -1287,7 +1384,7 @@ JSON response:
     
     try {
       const resolved = await this.resolveAssetClass(alpaca, symbol);
-      const orderSymbol = normalizeCryptoSymbol(resolved.symbol, this.state.config.crypto_symbols);
+      const orderSymbol = normalizeCryptoSymbol(resolved.symbol, this.getActiveCryptoSymbols());
       const order = await alpaca.trading.createOrder({
         symbol: orderSymbol,
         notional: Math.round(positionSize * 100) / 100,
@@ -1559,7 +1656,7 @@ JSON response:
       return null;
     }
 
-    const cacheKey = normalizeCryptoSymbol(symbol, this.state.config.crypto_symbols);
+    const cacheKey = normalizeCryptoSymbol(symbol, this.getActiveCryptoSymbols());
     const cached = this.state.signalResearch[cacheKey];
     const CACHE_TTL_MS = 180_000;
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
@@ -2087,7 +2184,144 @@ Response format:
   }
 
   private buildCryptoSymbolMap(): Map<string, string> {
-    return buildCryptoSymbolMap(this.state.config.crypto_symbols);
+    return buildCryptoSymbolMap(this.getActiveCryptoSymbols());
+  }
+
+  private getActiveCryptoSymbols(): string[] {
+    const fallback = this.state.config.crypto_symbols ?? ["BTC/USD", "ETH/USD", "SOL/USD"];
+    const topN = this.state.config.crypto_universe_top_n ?? 0;
+    if (topN <= 0) return fallback;
+    if (this.state.cryptoUniverseSymbols.length > 0) return this.state.cryptoUniverseSymbols;
+    return fallback;
+  }
+
+  private getCryptoBaseSymbol(symbol: string): string {
+    const normalized = normalizeSymbol(symbol);
+    if (normalized.includes("/")) {
+      return normalized.split("/")[0] ?? normalized;
+    }
+    if (normalized.endsWith("USD") && normalized.length > 3) {
+      return normalized.slice(0, -3);
+    }
+    return normalized;
+  }
+
+  private async refreshCryptoUniverse(
+    alpaca: ReturnType<typeof createAlpacaProviders>
+  ): Promise<void> {
+    const topN = this.state.config.crypto_universe_top_n ?? 0;
+    if (!this.state.config.crypto_enabled || topN <= 0) return;
+
+    const now = Date.now();
+    const refreshMs = Math.max(120_000, this.state.config.crypto_universe_refresh_ms || 0);
+    if (this.state.cryptoUniverseUpdatedAt && now - this.state.cryptoUniverseUpdatedAt < refreshMs) {
+      return;
+    }
+
+    let marketSymbols: string[] = [];
+    const hasCMCKey = !!this.env.COINMARKETCAP_API_KEY;
+    const provider = hasCMCKey ? "coinmarketcap" : "coinpaprika";
+    try {
+      if (hasCMCKey) {
+        const url = `https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest?sort=market_cap&sort_dir=desc&limit=${topN}&convert=USD`;
+        const response = await fetch(url, {
+          headers: {
+            "accept": "application/json",
+            "X-CMC_PRO_API_KEY": this.env.COINMARKETCAP_API_KEY || "",
+          },
+        });
+        if (!response.ok) {
+          this.log("Crypto", "universe_fetch_failed", { provider, status: response.status });
+          return;
+        }
+        const payload = await response.json() as { data?: Array<{ symbol?: string }> };
+        marketSymbols = (payload.data ?? [])
+          .map((entry) => (entry.symbol || "").toUpperCase())
+          .filter(Boolean)
+          .slice(0, topN);
+      } else {
+        const url = "https://api.coinpaprika.com/v1/tickers";
+        const response = await fetch(url, {
+          headers: { "accept": "application/json" },
+        });
+        if (!response.ok) {
+          this.log("Crypto", "universe_fetch_failed", { provider, status: response.status });
+          return;
+        }
+        const data = await response.json() as Array<{ symbol?: string; rank?: number }>;
+        const ranked = data
+          .filter((entry) => typeof entry.rank === "number" && entry.rank > 0 && entry.symbol)
+          .sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
+        const seen = new Set<string>();
+        for (const entry of ranked) {
+          if (marketSymbols.length >= topN) break;
+          const symbol = (entry.symbol || "").toUpperCase();
+          if (!symbol || seen.has(symbol)) continue;
+          seen.add(symbol);
+          marketSymbols.push(symbol);
+        }
+      }
+    } catch (error) {
+      this.log("Crypto", "universe_fetch_error", { provider, error: String(error) });
+      return;
+    }
+
+    if (marketSymbols.length === 0) {
+      this.log("Crypto", "universe_empty", { provider, reason: "No symbols returned" });
+      return;
+    }
+
+    let assets: Asset[] = [];
+    try {
+      assets = await alpaca.trading.listAssets({ status: "active", asset_class: "crypto" });
+    } catch (error) {
+      this.log("Crypto", "universe_alpaca_assets_failed", { error: String(error) });
+      return;
+    }
+
+    const tradableMap = new Map<string, string>();
+    for (const asset of assets) {
+      if (!asset.tradable || asset.status !== "active" || asset.class !== "crypto") continue;
+
+      const normalized = normalizeSymbol(asset.symbol);
+      if (normalized.includes("/")) {
+        const [base, quote] = normalized.split("/");
+        if (!base || quote !== "USD") continue;
+        if (!tradableMap.has(base)) {
+          tradableMap.set(base, normalized);
+        }
+        continue;
+      }
+
+      if (normalized.endsWith("USD") && normalized.length > 3) {
+        const base = normalized.slice(0, -3);
+        if (!tradableMap.has(base)) {
+          tradableMap.set(base, normalized);
+        }
+      }
+    }
+
+    const matched: string[] = [];
+    for (const symbol of marketSymbols) {
+      const alpacaSymbol = tradableMap.get(symbol);
+      if (alpacaSymbol) matched.push(alpacaSymbol);
+    }
+
+    const unique = Array.from(new Set(matched));
+    if (unique.length === 0) {
+      this.log("Crypto", "universe_no_match", { provider, requested: topN, symbols: marketSymbols.length });
+      return;
+    }
+
+    this.state.cryptoUniverseSymbols = unique;
+    this.state.cryptoUniverseUpdatedAt = now;
+    this.log("Crypto", "universe_updated", {
+      provider,
+      requested: topN,
+      symbols: marketSymbols.length,
+      alpaca: unique.length,
+      refresh_ms: refreshMs,
+    });
   }
 
   private async resolveAssetClass(

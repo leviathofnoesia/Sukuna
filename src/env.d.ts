@@ -11,6 +11,7 @@ export interface Env {
   OPENAI_API_KEY?: string;
   TWITTER_BEARER_TOKEN?: string;
   DISCORD_WEBHOOK_URL?: string;
+  COINMARKETCAP_API_KEY?: string;
   MAHORAGA_API_TOKEN: string;
   KILL_SWITCH_SECRET: string;
 

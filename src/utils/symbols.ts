@@ -10,7 +10,16 @@ export function buildCryptoSymbolMap(cryptoSymbols?: string[]): Map<string, stri
   const map = new Map<string, string>();
   for (const symbol of cryptoSymbols ?? []) {
     const normalized = normalizeSymbol(symbol);
-    map.set(normalized.replace("/", ""), normalized);
+    const compact = normalized.replace("/", "");
+    map.set(compact, normalized);
+    if (normalized.includes("/")) {
+      const base = normalized.split("/")[0] ?? normalized;
+      map.set(base, normalized);
+    } else if (normalized.endsWith("USD") && normalized.length > 3) {
+      map.set(normalized.slice(0, -3), normalized);
+    } else {
+      map.set(normalized, normalized);
+    }
   }
   return map;
 }
