@@ -511,6 +511,12 @@ export class MahoragaHarness extends DurableObject<Env> {
           ...stored,
           config: { ...DEFAULT_CONFIG, ...stored.config },
         };
+        if (this.state.alphaScan && !("edge_candidates" in this.state.alphaScan)) {
+          this.state.alphaScan = {
+            ...this.state.alphaScan,
+            edge_candidates: [],
+          };
+        }
       }
     });
   }
@@ -1597,15 +1603,16 @@ export class MahoragaHarness extends DurableObject<Env> {
       return;
     }
 
-    const alphaCandidates = (this.state.alphaScan.edge_candidates.length > 0
-      ? this.state.alphaScan.edge_candidates
+    const edgeCandidates = this.state.alphaScan.edge_candidates ?? [];
+    const alphaCandidates = (edgeCandidates.length > 0
+      ? edgeCandidates
       : this.state.alphaScan.top_alpha
     ).filter((entry) => entry.isCrypto);
     if (alphaCandidates.length === 0) {
       this.log("Crypto", "entry_skipped_no_alpha", {
         reason: "No alpha candidates for crypto",
         alpha_total: this.state.alphaScan.top_alpha.length,
-        edge_candidates: this.state.alphaScan.edge_candidates.length,
+        edge_candidates: edgeCandidates.length,
       });
       return;
     }
