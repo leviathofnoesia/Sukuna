@@ -232,6 +232,7 @@ interface AlphaScanState {
   volume_pass: number;
   liquidity_pass: number;
   edge_pass: number;
+  edge_candidates: AlphaMarket[];
   top_alpha: AlphaMarket[];
 }
 
@@ -377,6 +378,7 @@ const DEFAULT_STATE: AgentState = {
     volume_pass: 0,
     liquidity_pass: 0,
     edge_pass: 0,
+    edge_candidates: [],
     top_alpha: [],
   },
   enabled: false,
@@ -1092,6 +1094,13 @@ export class MahoragaHarness extends DurableObject<Env> {
     return this.clampProbability(0.5 + clamped);
   }
 
+  private computeAlphaConfidence(alpha: number): number {
+    const threshold = this.state.config.alpha_edge_threshold || 0.2;
+    const span = Math.max(0.05, 1 - threshold);
+    const scaled = (alpha - threshold) / span;
+    return this.clampProbability(0.5 + scaled * 0.5);
+  }
+
   private async runAlphaScan(): Promise<void> {
     if (!this.state.config.alpha_scan_enabled) return;
 
@@ -1109,24 +1118,31 @@ export class MahoragaHarness extends DurableObject<Env> {
         volume_pass: 0,
         liquidity_pass: 0,
         edge_pass: 0,
+        edge_candidates: [],
         top_alpha: [],
       };
       return;
     }
 
-    const aggregated = new Map<string, { symbol: string; isCrypto: boolean; sentiment: number; count: number }>();
+    const aggregated = new Map<string, { symbol: string; isCrypto: boolean; sentiment: number; count: number; momentum: number; momentumCount: number }>();
     for (const sig of signals) {
       const symbol = normalizeSymbol(sig.symbol);
       const existing = aggregated.get(symbol);
       if (existing) {
         existing.sentiment += sig.sentiment;
         existing.count += 1;
+        if (sig.momentum !== undefined && Number.isFinite(sig.momentum)) {
+          existing.momentum += sig.momentum;
+          existing.momentumCount += 1;
+        }
       } else {
         aggregated.set(symbol, {
           symbol,
           isCrypto: !!sig.isCrypto,
           sentiment: sig.sentiment,
           count: 1,
+          momentum: sig.momentum ?? 0,
+          momentumCount: sig.momentum !== undefined ? 1 : 0,
         });
       }
     }
@@ -1137,6 +1153,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         symbol: entry.symbol,
         isCrypto: entry.isCrypto,
         sentimentAvg: entry.sentiment / entry.count,
+        momentumAvg: entry.momentumCount > 0 ? entry.momentum / entry.momentumCount : null,
       }))
       .sort((a, b) => b.sentimentAvg - a.sentimentAvg)
       .slice(0, maxMarkets);
@@ -1148,6 +1165,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         volume_pass: 0,
         liquidity_pass: 0,
         edge_pass: 0,
+        edge_candidates: [],
         top_alpha: [],
       };
       return;
@@ -1233,7 +1251,13 @@ export class MahoragaHarness extends DurableObject<Env> {
       let avgAbsReturn = Math.max(Math.abs(dailyReturn), 0.02);
       let calcProb = this.clampProbability(market.sentimentAvg);
 
-      if (!market.isCrypto) {
+      if (market.isCrypto) {
+        const momentumAvg = market.momentumAvg ?? 0;
+        const momentumEdge = Math.max(-0.4, Math.min(0.4, momentumAvg / 10));
+        const momentumProb = this.clampProbability(0.5 + momentumEdge);
+        const sentimentProb = this.clampProbability(market.sentimentAvg);
+        calcProb = this.clampProbability(0.7 * momentumProb + 0.3 * sentimentProb);
+      } else {
         try {
           const bars = await alpaca.marketData.getBars(market.symbol, "1Day", { limit: lookback });
           const barAvgAbs = this.computeAvgAbsReturn(bars);
@@ -1265,6 +1289,11 @@ export class MahoragaHarness extends DurableObject<Env> {
       });
     }
 
+    const edgeCandidates = edgePass
+      .filter((m) => m.alpha > 0)
+      .sort((a, b) => b.alpha - a.alpha)
+      .slice(0, 25);
+
     const topAlpha = edgePass
       .filter((m) => m.alpha >= edgeThreshold)
       .sort((a, b) => b.alpha - a.alpha)
@@ -1285,6 +1314,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       volume_pass: volumePass.length,
       liquidity_pass: liquidityPass.length,
       edge_pass: edgePass.length,
+      edge_candidates: edgeCandidates,
       top_alpha: topAlpha,
     };
 
@@ -1293,6 +1323,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       volume_pass: volumePass.length,
       liquidity_pass: liquidityPass.length,
       edge_pass: edgePass.length,
+      edge_candidates: edgeCandidates.length,
       top_alpha: topAlpha.length,
     });
   }
@@ -1565,67 +1596,67 @@ export class MahoragaHarness extends DurableObject<Env> {
       });
       return;
     }
-    
+
+    const alphaCandidates = (this.state.alphaScan.edge_candidates.length > 0
+      ? this.state.alphaScan.edge_candidates
+      : this.state.alphaScan.top_alpha
+    ).filter((entry) => entry.isCrypto);
+    if (alphaCandidates.length === 0) {
+      this.log("Crypto", "entry_skipped_no_alpha", {
+        reason: "No alpha candidates for crypto",
+        alpha_total: this.state.alphaScan.top_alpha.length,
+        edge_candidates: this.state.alphaScan.edge_candidates.length,
+      });
+      return;
+    }
+
+    const alphaBySymbol = new Map<string, AlphaMarket>();
+    for (const entry of alphaCandidates) {
+      alphaBySymbol.set(normalizeSymbol(entry.symbol), entry);
+    }
+
+    const momentumThreshold = this.state.config.crypto_momentum_threshold || 2.0;
     const cryptoSignals = this.state.signalCache
       .filter(s => s.isCrypto)
       .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
-      .filter(s => s.sentiment > 0)
-      .sort((a, b) => (b.momentum || 0) - (a.momentum || 0));
+      .filter(s => !this.isStablecoinSymbol(s.symbol))
+      .filter(s => (s.momentum ?? 0) >= momentumThreshold)
+      .filter(s => alphaBySymbol.has(normalizeSymbol(s.symbol)))
+      .sort((a, b) => {
+        const alphaA = alphaBySymbol.get(normalizeSymbol(a.symbol))?.alpha ?? 0;
+        const alphaB = alphaBySymbol.get(normalizeSymbol(b.symbol))?.alpha ?? 0;
+        return alphaB - alphaA;
+      });
 
     if (cryptoSignals.length === 0) {
       this.log("Crypto", "entry_skipped_no_signals", {
         total_signals: this.state.signalCache.length,
         held_crypto: heldCrypto.size,
+        alpha_crypto: alphaCandidates.length,
       });
       return;
     }
-    
-    const now = Date.now();
-    const CRYPTO_RESEARCH_TTL_MS = 300_000;
-    const CRYPTO_RESEARCH_COOLDOWN_MS = 600_000;
 
-    const candidateSignals = cryptoSignals.filter((signal) => {
-      const existing = this.state.signalResearch[signal.symbol];
-      return !existing || now - existing.timestamp > CRYPTO_RESEARCH_COOLDOWN_MS;
-    });
+    const account = await alpaca.trading.getAccount();
 
-    const signalsToCheck = (candidateSignals.length > 0 ? candidateSignals : cryptoSignals).slice(0, 4);
-
-    for (const signal of signalsToCheck) {
+    for (const signal of cryptoSignals) {
       if (cryptoPositions.length >= maxCryptoPositions) break;
-      
-      const existingResearch = this.state.signalResearch[signal.symbol];
-      
-      let research: ResearchResult | null = existingResearch ?? null;
-      if (!existingResearch || now - existingResearch.timestamp > CRYPTO_RESEARCH_TTL_MS) {
-        research = await this.researchCrypto(signal.symbol, signal.momentum || 0, signal.sentiment);
-      }
-      
-      if (!research || research.verdict !== "BUY") {
-        this.log("Crypto", "research_skip", {
-          symbol: signal.symbol,
-          reason: research ? "verdict_not_buy" : "no_research",
-          verdict: research?.verdict || "NO_RESEARCH",
-          confidence: research?.confidence || 0,
-        });
+
+      const alphaEntry = alphaBySymbol.get(normalizeSymbol(signal.symbol));
+      if (!alphaEntry) {
+        this.log("Crypto", "entry_skipped_no_alpha_match", { symbol: signal.symbol });
         continue;
       }
-      
-      const cryptoMinConfidence = this.state.config.crypto_min_analyst_confidence ?? this.state.config.min_analyst_confidence;
-      if (research.confidence < cryptoMinConfidence) {
-        this.log("Crypto", "research_skip", {
-          reason: "below_threshold",
-          symbol: signal.symbol,
-          confidence: research.confidence,
-          required: cryptoMinConfidence,
-        });
-        continue;
-      }
-      
-      const account = await alpaca.trading.getAccount();
-      const resultSymbol = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
-      
+
+      const confidence = this.computeAlphaConfidence(alphaEntry.alpha);
+      const resultSymbol = await this.executeCryptoBuy(alpaca, signal.symbol, confidence, account);
+
       if (resultSymbol) {
+        this.log("Crypto", "alpha_trade", {
+          symbol: resultSymbol,
+          alpha: Number(alphaEntry.alpha.toFixed(4)),
+          confidence: Number(confidence.toFixed(3)),
+        });
         heldCrypto.add(cryptoSymbolKey(resultSymbol));
         cryptoPositions.push({ symbol: resultSymbol } as Position);
         break;

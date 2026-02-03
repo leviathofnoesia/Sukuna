@@ -227,6 +227,15 @@ export interface Status {
     volume_pass: number
     liquidity_pass: number
     edge_pass: number
+    edge_candidates: Array<{
+      symbol: string
+      isCrypto: boolean
+      notional_volume: number
+      spread_pct: number | null
+      implied_prob: number
+      calculated_prob: number
+      alpha: number
+    }>
     top_alpha: Array<{
       symbol: string
       isCrypto: boolean
