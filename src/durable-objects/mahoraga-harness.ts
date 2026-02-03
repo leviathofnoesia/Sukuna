@@ -511,7 +511,8 @@ export class MahoragaHarness extends DurableObject<Env> {
           ...stored,
           config: { ...DEFAULT_CONFIG, ...stored.config },
         };
-        if (this.state.alphaScan && !("edge_candidates" in this.state.alphaScan)) {
+        const storedAlpha = stored.alphaScan as Record<string, unknown> | undefined;
+        if (storedAlpha && !("edge_candidates" in storedAlpha)) {
           this.state.alphaScan.edge_candidates = [];
         }
       }
