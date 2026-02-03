@@ -19,5 +19,6 @@
   "llm_analyst_model": "gpt-5.2",
   "llm_max_tokens": 500,
   
-  "starting_equity": 100000
+  "starting_equity": 100000,
+  "stock_watchlist_symbols": []
 }

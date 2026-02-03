@@ -1,0 +1,1296 @@
+From 2335992cf1f6cd1dc0fdcdb5c82e733f6d2aeafb Mon Sep 17 00:00:00 2001
+From: leviathofnoesia <billygbruh@gmail.com>
+Date: Mon, 2 Feb 2026 18:32:29 -0500
+Subject: [PATCH] fix: add asset prefilter and manual close
+
+---
+ AGENTS.md                               |  39 +++
+ agent-config.example.json               |   5 +-
+ dashboard/src/App.tsx                   |  46 ++-
+ dashboard/src/types.ts                  |   1 +
+ dashboard/vite.config.ts                |   6 +-
+ package-lock.json                       |   4 +-
+ src/durable-objects/mahoraga-harness.ts | 367 ++++++++++++++++++++----
+ src/mcp/agent.ts                        |  65 +++--
+ src/providers/alpaca/market-data.ts     |  83 +++++-
+ src/utils/symbols.ts                    |  32 +++
+ wrangler.jsonc                          | 186 ++++++------
+ 11 files changed, 646 insertions(+), 188 deletions(-)
+ create mode 100644 AGENTS.md
+ create mode 100644 src/utils/symbols.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 100644
+index 0000000..98842e2
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,39 @@
++# Repository Guidelines
++
++## Project Structure & Module Organization
++- `src/` contains the Cloudflare Worker (TypeScript, ESM). Durable Objects live in `src/durable-objects/` and the main harness is `src/durable-objects/mahoraga-harness.ts`.
++- `dashboard/` is the React + Vite UI for monitoring and control.
++- `migrations/` holds D1 database migrations; `scripts/` contains setup helpers.
++- `docs/` stores extended documentation. `wrangler.jsonc` is the Worker config; `.env.example` and `agent-config.example.json` are templates.
++
++## Build, Test, and Development Commands
++Run from the repo root unless noted:
++- `npm run dev` — start the Worker locally with Wrangler.
++- `npm run build` — run `tsc` for the Worker (type-checks).
++- `npm run typecheck` — explicit no-emit type check.
++- `npm run lint` — lint `src/` with ESLint.
++- `npm run test` / `npm run test:run` — Vitest watch mode or one-shot.
++- `npm run db:migrate` / `npm run db:migrate:remote` — apply D1 migrations locally or remotely.
++- `npm run deploy` / `npm run deploy:production` — deploy the Worker.
++- `npm run setup:access` — configure Cloudflare Access (see `README.md`).
++
++Dashboard (from `dashboard/`):
++- `npm run dev`, `npm run build`, `npm run preview`.
++
++## Coding Style & Naming Conventions
++- TypeScript (ESM) with strict compiler settings; keep files 2-space indented.
++- Prefer existing naming patterns: `kebab-case` for files, `camelCase` for functions/vars, `PascalCase` for types/classes.
++- Use the `@/*` path alias for imports from `src/` when helpful.
++
++## Testing Guidelines
++- Framework: Vitest. No coverage threshold is enforced.
++- Recommended naming: `*.test.ts` or `*.spec.ts` near the code under test.
++- Run locally with `npm run test` (watch) or `npm run test:run` (CI-style).
++
++## Commit & Pull Request Guidelines
++- Use Conventional Commits as seen in history: `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `ci:`, `legal:`, and optional scopes like `fix(dashboard):`.
++- PRs should include: a concise summary, testing performed, and screenshots for dashboard/UI changes. Call out any config or migration changes.
++
++## Security & Configuration Tips
++- Never commit secrets. Use `wrangler secret put` for API tokens and credentials.
++- Keep new config options documented in `README.md` and mirrored in `.env.example` when applicable.
+diff --git a/agent-config.example.json b/agent-config.example.json
+index abb7cbc..d356442 100644
+--- a/agent-config.example.json
++++ b/agent-config.example.json
+@@ -1,5 +1,5 @@
+ {
+-  "mcp_url": "http://localhost:8787/mcp",
++  "mcp_url": "http://mahoraga.leviath.workers.dev/mcp",
+   
+   "data_poll_interval_ms": 30000,
+   "analyst_interval_ms": 120000,
+@@ -9,13 +9,14 @@
+   "min_sentiment_score": 0.3,
+   "min_analyst_confidence": 0.6,
+   "sell_sentiment_threshold": -0.2,
++  "allowed_exchanges": [],
+   
+   "take_profit_pct": 10,
+   "stop_loss_pct": 5,
+   "position_size_pct_of_cash": 25,
+   
+   "llm_model": "gpt-4o-mini",
+-  "llm_analyst_model": "gpt-4o",
++  "llm_analyst_model": "gpt-5.2",
+   "llm_max_tokens": 500,
+   
+   "starting_equity": 100000
+diff --git a/dashboard/src/App.tsx b/dashboard/src/App.tsx
+index 9834cd0..3452f6f 100644
+--- a/dashboard/src/App.tsx
++++ b/dashboard/src/App.tsx
+@@ -131,6 +131,7 @@ export default function App() {
+   const [setupChecked, setSetupChecked] = useState(false)
+   const [time, setTime] = useState(new Date())
+   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
++  const [closingSymbol, setClosingSymbol] = useState<string | null>(null)
+   const logsEndRef = useRef<HTMLDivElement>(null)
+ 
+   useEffect(() => {
+@@ -184,7 +185,7 @@ export default function App() {
+       }
+     }
+ 
+-    if (setupChecked && !showSetup) {
++    if (setupChecked && !showSetup && !showSettings) {
+       fetchStatus()
+       const interval = setInterval(fetchStatus, 5000)
+       const timeInterval = setInterval(() => setTime(new Date()), 1000)
+@@ -194,7 +195,7 @@ export default function App() {
+         clearInterval(timeInterval)
+       }
+     }
+-  }, [setupChecked, showSetup])
++  }, [setupChecked, showSetup, showSettings])
+ 
+   useEffect(() => {
+     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+@@ -211,6 +212,32 @@ export default function App() {
+     }
+   }
+ 
++  const handleClosePosition = async (symbol: string) => {
++    if (closingSymbol) return
++    if (!confirm(`Close ${symbol} position?`)) return
++    setClosingSymbol(symbol)
++    try {
++      const res = await authFetch(`${API_BASE}/positions/close`, {
++        method: 'POST',
++        body: JSON.stringify({ symbol, reason: 'manual_close' }),
++      })
++      const data = await res.json()
++      if (!data.ok) {
++        alert(data.error || `Failed to close ${symbol}`)
++        return
++      }
++      const statusRes = await authFetch(`${API_BASE}/status`)
++      const statusData = await statusRes.json()
++      if (statusData.ok) {
++        setStatus(statusData.data)
++      }
++    } catch {
++      alert(`Failed to close ${symbol}`)
++    } finally {
++      setClosingSymbol(null)
++    }
++  }
++
+   // Derived state (must stay above early returns per React hooks rules)
+   const account = status?.account
+   const positions = status?.positions || []
+@@ -403,6 +430,7 @@ export default function App() {
+                         <th className="hud-label text-right py-2 px-2 hidden md:table-cell">Value</th>
+                         <th className="hud-label text-right py-2 px-2">P&L</th>
+                         <th className="hud-label text-center py-2 px-2">Trend</th>
++                        <th className="hud-label text-right py-2 px-2">Close</th>
+                       </tr>
+                     </thead>
+                     <tbody>
+@@ -412,6 +440,8 @@ export default function App() {
+                         const posEntry = status?.positionEntries?.[pos.symbol]
+                         const staleness = status?.stalenessAnalysis?.[pos.symbol]
+                         const holdTime = posEntry ? Math.floor((Date.now() - posEntry.entry_time) / 3600000) : null
++                        const isCryptoPos = isCryptoSymbol(pos.symbol, config?.crypto_symbols)
++                        const canClose = isMarketOpen || isCryptoPos
+                         
+                         return (
+                           <motion.tr 
+@@ -442,7 +472,7 @@ export default function App() {
+                                 }
+                               >
+                                 <span className="cursor-help border-b border-dotted border-hud-text-dim">
+-                                  {isCryptoSymbol(pos.symbol, config?.crypto_symbols) && (
++                                  {isCryptoPos && (
+                                     <span className="text-hud-warning mr-1">₿</span>
+                                   )}
+                                   {pos.symbol}
+@@ -463,6 +493,16 @@ export default function App() {
+                                 <Sparkline data={priceHistory} width={60} height={20} />
+                               </div>
+                             </td>
++                            <td className="py-2 px-2 text-right">
++                              <button
++                                className="hud-button text-[10px] px-2 py-1"
++                                onClick={() => handleClosePosition(pos.symbol)}
++                                disabled={!canClose || closingSymbol === pos.symbol}
++                                title={!canClose ? 'Market closed for equities' : 'Close position'}
++                              >
++                                {closingSymbol === pos.symbol ? 'Closing...' : 'Close'}
++                              </button>
++                            </td>
+                           </motion.tr>
+                         )
+                       })}
+diff --git a/dashboard/src/types.ts b/dashboard/src/types.ts
+index 254c6cd..8b66431 100644
+--- a/dashboard/src/types.ts
++++ b/dashboard/src/types.ts
+@@ -62,6 +62,7 @@ export interface Config {
+   take_profit_pct: number
+   stop_loss_pct: number
+   position_size_pct_of_cash: number
++  allowed_exchanges?: string[] | null
+   llm_model: string
+   llm_analyst_model?: string
+   llm_max_tokens: number
+diff --git a/dashboard/vite.config.ts b/dashboard/vite.config.ts
+index f94ce81..20f6dd9 100644
+--- a/dashboard/vite.config.ts
++++ b/dashboard/vite.config.ts
+@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
+ import react from '@vitejs/plugin-react'
+ import tailwindcss from '@tailwindcss/vite'
+ 
+-const wranglerPort = process.env.WRANGLER_PORT || '8787'
++const workerUrl = "https://mahoraga.leviath.workers.dev/"
+ 
+ export default defineConfig({
+   plugins: [react(), tailwindcss()],
+@@ -10,10 +10,10 @@ export default defineConfig({
+     port: 3000,
+     proxy: {
+       '/api': {
+-        target: `http://localhost:${wranglerPort}`,
++        target: workerUrl,
+         changeOrigin: true,
+         rewrite: (path) => path.replace(/^\/api/, '/agent'),
+       },
+     },
+   },
+-})
++})
+\ No newline at end of file
+diff --git a/package-lock.json b/package-lock.json
+index 58b92fd..e3cbe13 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "mahoraga",
+-  "version": "0.1.0",
++  "version": "0.3.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "mahoraga",
+-      "version": "0.1.0",
++      "version": "0.3.0",
+       "dependencies": {
+         "@modelcontextprotocol/sdk": "^1.0.0",
+         "agents": "^0.0.74",
+diff --git a/src/durable-objects/mahoraga-harness.ts b/src/durable-objects/mahoraga-harness.ts
+index 3502ca0..f3101cd 100644
+--- a/src/durable-objects/mahoraga-harness.ts
++++ b/src/durable-objects/mahoraga-harness.ts
+@@ -39,7 +39,14 @@ import { DurableObject } from "cloudflare:workers";
+ import OpenAI from "openai";
+ import type { Env } from "../env.d";
+ import { createAlpacaProviders } from "../providers/alpaca";
+-import type { Account, Position, MarketClock } from "../providers/types";
++import type { Account, Position, MarketClock, Asset } from "../providers/types";
++import {
++  buildCryptoSymbolMap,
++  cryptoSymbolKey,
++  normalizeCryptoSymbol,
++  normalizeSymbol,
++  toSlashUsdSymbol,
++} from "../utils/symbols";
+ 
+ // ============================================================================
+ // SECTION 1: TYPES & CONFIGURATION
+@@ -59,6 +66,7 @@ interface AgentConfig {
+   min_sentiment_score: number;     // [TUNE] Min sentiment to consider buying (0-1)
+   min_analyst_confidence: number;  // [TUNE] Min LLM confidence to execute (0-1)
+   sell_sentiment_threshold: number; // [TUNE] Sentiment below this triggers sell review
++  allowed_exchanges: string[] | null; // [TUNE] Optional allowlist for equity exchanges (null = allow all)
+   
+   // Risk management - take profit and stop loss
+   take_profit_pct: number;         // [TUNE] Take profit at this % gain
+@@ -259,6 +267,7 @@ const DEFAULT_CONFIG: AgentConfig = {
+   min_sentiment_score: 0.3,
+   min_analyst_confidence: 0.6,
+   sell_sentiment_threshold: -0.2,
++  allowed_exchanges: null,
+   take_profit_pct: 10,
+   stop_loss_pct: 5,
+   position_size_pct_of_cash: 25,
+@@ -583,7 +592,7 @@ export class MahoragaHarness extends DurableObject<Env> {
+     const url = new URL(request.url);
+     const action = url.pathname.slice(1);
+ 
+-    const protectedActions = ["enable", "disable", "config", "trigger", "status", "logs", "costs", "signals", "setup/status"];
++    const protectedActions = ["enable", "disable", "config", "trigger", "status", "logs", "costs", "signals", "setup/status", "positions/close"];
+     if (protectedActions.includes(action)) {
+       if (!this.isAuthorized(request)) {
+         return this.unauthorizedResponse();
+@@ -622,6 +631,12 @@ export class MahoragaHarness extends DurableObject<Env> {
+         case "trigger":
+           await this.alarm();
+           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
++
++        case "positions/close":
++          if (request.method !== "POST") {
++            return new Response("Method not allowed", { status: 405 });
++          }
++          return this.handleClosePosition(request);
+         
+         case "kill":
+           if (!this.isKillSwitchAuthorized(request)) {
+@@ -712,6 +727,44 @@ export class MahoragaHarness extends DurableObject<Env> {
+     return this.jsonResponse({ logs });
+   }
+ 
++  private async handleClosePosition(request: Request): Promise<Response> {
++    const body = await request.json() as { symbol?: string; reason?: string };
++    const symbol = body.symbol ? normalizeSymbol(body.symbol) : null;
++
++    if (!symbol) {
++      return new Response(
++        JSON.stringify({ ok: false, error: "symbol is required" }),
++        { status: 400, headers: { "Content-Type": "application/json" } }
++      );
++    }
++
++    const alpaca = createAlpacaProviders(this.env);
++    const reason = body.reason ? `Manual close: ${body.reason}` : "Manual close";
++
++    const resolved = await this.resolveAssetClass(alpaca, symbol);
++    if (!resolved.asset) {
++      return this.jsonResponse({ ok: false, error: "Asset not found", symbol });
++    }
++
++    if (!resolved.isCrypto) {
++      const clock = await alpaca.trading.getClock().catch(() => null);
++      if (clock && !clock.is_open) {
++        return this.jsonResponse({ ok: false, error: "Market closed", symbol });
++      }
++    }
++
++    const candidateSymbols = new Set<string>([
++      symbol,
++      resolved.symbol,
++      normalizeSymbol(resolved.asset.symbol),
++    ]);
++
++    const result = await this.closePositionWithFallback(alpaca, Array.from(candidateSymbols), reason);
++    await this.persist();
++
++    return this.jsonResponse({ ok: result.ok, symbol: result.symbol ?? symbol, error: result.error });
++  }
++
+   private async handleKillSwitch(): Promise<Response> {
+     this.state.enabled = false;
+     await this.ctx.storage.deleteAlarm();
+@@ -750,16 +803,82 @@ export class MahoragaHarness extends DurableObject<Env> {
+       this.gatherCrypto(),
+     ]);
+     
+-    this.state.signalCache = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals];
++    const mergedSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals];
++    const filteredSignals = await this.prefilterSignals(mergedSignals);
++    this.state.signalCache = filteredSignals;
+     
+     this.log("System", "data_gathered", {
+       stocktwits: stocktwitsSignals.length,
+       reddit: redditSignals.length,
+       crypto: cryptoSignals.length,
+       total: this.state.signalCache.length,
++      filtered_out: mergedSignals.length - filteredSignals.length,
+     });
+   }
+ 
++  private getExchangeAllowlist(): Set<string> | null {
++    const allowlist = (this.state.config.allowed_exchanges ?? [])
++      .map(entry => entry.trim().toUpperCase())
++      .filter(Boolean);
++    if (allowlist.length === 0) return null;
++    return new Set(allowlist);
++  }
++
++  private async prefilterSignals(signals: Signal[]): Promise<Signal[]> {
++    if (signals.length === 0) return signals;
++
++    const alpaca = createAlpacaProviders(this.env);
++    const allowlist = this.getExchangeAllowlist();
++    const decisions = new Map<string, { allowed: boolean; symbol: string; isCrypto: boolean }>();
++    const filtered: Signal[] = [];
++
++    for (const signal of signals) {
++      const cacheKey = cryptoSymbolKey(signal.symbol);
++      let decision = decisions.get(cacheKey);
++
++      if (!decision) {
++        const resolved = await this.resolveAssetClass(alpaca, signal.symbol);
++
++        if (!resolved.asset) {
++          this.log("SignalFilter", "asset_unavailable", { symbol: resolved.symbol });
++          decision = { allowed: false, symbol: resolved.symbol, isCrypto: resolved.isCrypto };
++        } else if (!resolved.asset.tradable) {
++          this.log("SignalFilter", "asset_not_tradable", {
++            symbol: resolved.symbol,
++            tradable: resolved.asset.tradable,
++            status: resolved.asset.status,
++          });
++          decision = { allowed: false, symbol: resolved.symbol, isCrypto: resolved.isCrypto };
++        } else if (allowlist && !allowlist.has(resolved.asset.exchange.toUpperCase())) {
++          this.log("SignalFilter", "asset_exchange_blocked", {
++            symbol: resolved.symbol,
++            exchange: resolved.asset.exchange,
++            allowlist: Array.from(allowlist),
++          });
++          decision = { allowed: false, symbol: resolved.symbol, isCrypto: resolved.isCrypto };
++        } else {
++          decision = {
++            allowed: true,
++            symbol: normalizeSymbol(resolved.asset.symbol),
++            isCrypto: resolved.isCrypto,
++          };
++        }
++
++        decisions.set(cacheKey, decision);
++      }
++
++      if (decision.allowed) {
++        filtered.push({
++          ...signal,
++          symbol: decision.symbol,
++          isCrypto: signal.isCrypto ?? decision.isCrypto,
++        });
++      }
++    }
++
++    return filtered;
++  }
++
+   private async gatherStockTwits(): Promise<Signal[]> {
+     const signals: Signal[] = [];
+     const sourceWeight = SOURCE_CONFIG.weights.stocktwits;
+@@ -992,9 +1111,11 @@ export class MahoragaHarness extends DurableObject<Env> {
+   ): Promise<void> {
+     if (!this.state.config.crypto_enabled) return;
+     
+-    const cryptoSymbols = new Set(this.state.config.crypto_symbols || []);
+-    const cryptoPositions = positions.filter(p => cryptoSymbols.has(p.symbol) || p.symbol.includes("/"));
+-    const heldCrypto = new Set(cryptoPositions.map(p => p.symbol));
++    const cryptoSymbolKeys = new Set((this.state.config.crypto_symbols ?? []).map(cryptoSymbolKey));
++    const cryptoPositions = positions.filter(p =>
++      cryptoSymbolKeys.has(cryptoSymbolKey(p.symbol)) || p.symbol.includes("/")
++    );
++    const heldCrypto = new Set(cryptoPositions.map(p => cryptoSymbolKey(p.symbol)));
+     
+     for (const pos of cryptoPositions) {
+       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
+@@ -1017,7 +1138,7 @@ export class MahoragaHarness extends DurableObject<Env> {
+     
+     const cryptoSignals = this.state.signalCache
+       .filter(s => s.isCrypto)
+-      .filter(s => !heldCrypto.has(s.symbol))
++      .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
+       .filter(s => s.sentiment > 0)
+       .sort((a, b) => (b.momentum || 0) - (a.momentum || 0));
+     
+@@ -1047,11 +1168,11 @@ export class MahoragaHarness extends DurableObject<Env> {
+       }
+       
+       const account = await alpaca.trading.getAccount();
+-      const result = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
++      const resultSymbol = await this.executeCryptoBuy(alpaca, signal.symbol, research.confidence, account);
+       
+-      if (result) {
+-        heldCrypto.add(signal.symbol);
+-        cryptoPositions.push({ symbol: signal.symbol } as Position);
++      if (resultSymbol) {
++        heldCrypto.add(cryptoSymbolKey(resultSymbol));
++        cryptoPositions.push({ symbol: resultSymbol } as Position);
+         break;
+       }
+     }
+@@ -1152,7 +1273,7 @@ JSON response:
+     symbol: string,
+     confidence: number,
+     account: Account
+-  ): Promise<boolean> {
++  ): Promise<string | null> {
+     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+     const positionSize = Math.min(
+       account.cash * (sizePct / 100) * confidence,
+@@ -1161,23 +1282,25 @@ JSON response:
+     
+     if (positionSize < 10) {
+       this.log("Crypto", "buy_skipped", { symbol, reason: "Position too small" });
+-      return false;
++      return null;
+     }
+     
+     try {
++      const resolved = await this.resolveAssetClass(alpaca, symbol);
++      const orderSymbol = normalizeCryptoSymbol(resolved.symbol, this.state.config.crypto_symbols);
+       const order = await alpaca.trading.createOrder({
+-        symbol,
++        symbol: orderSymbol,
+         notional: Math.round(positionSize * 100) / 100,
+         side: "buy",
+         type: "market",
+         time_in_force: "gtc",
+       });
+       
+-      this.log("Crypto", "buy_executed", { symbol, status: order.status, size: positionSize });
+-      return true;
++      this.log("Crypto", "buy_executed", { symbol: orderSymbol, status: order.status, size: positionSize });
++      return orderSymbol;
+     } catch (error) {
+       this.log("Crypto", "buy_failed", { symbol, error: String(error) });
+-      return false;
++      return null;
+     }
+   }
+ 
+@@ -1428,14 +1551,16 @@ JSON response:
+   private async researchSignal(
+     symbol: string,
+     sentimentScore: number,
+-    sources: string[]
++    sources: string[],
++    priceHint?: number
+   ): Promise<ResearchResult | null> {
+     if (!this._openai) {
+       this.log("SignalResearch", "skipped_no_openai", { symbol, reason: "OPENAI_API_KEY not configured" });
+       return null;
+     }
+ 
+-    const cached = this.state.signalResearch[symbol];
++    const cacheKey = normalizeCryptoSymbol(symbol, this.state.config.crypto_symbols);
++    const cached = this.state.signalResearch[cacheKey];
+     const CACHE_TTL_MS = 180_000;
+     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+       return cached;
+@@ -1443,16 +1568,48 @@ JSON response:
+ 
+     try {
+       const alpaca = createAlpacaProviders(this.env);
+-      const quote = await alpaca.marketData.getQuote(symbol).catch(() => null);
+-      const price = quote?.ask_price || quote?.bid_price || 0;
++      const resolved = await this.resolveAssetClass(alpaca, symbol);
++      const isCrypto = resolved.isCrypto;
++      const promptSymbol = resolved.symbol;
++
++      if (!isCrypto) {
++        if (!resolved.asset) {
++          this.log("SignalResearch", "asset_unavailable", { symbol: promptSymbol });
++          return null;
++        }
++        if (resolved.asset.status !== "active" || !resolved.asset.tradable) {
++          this.log("SignalResearch", "asset_not_tradable", {
++            symbol: promptSymbol,
++            status: resolved.asset.status,
++            tradable: resolved.asset.tradable,
++          });
++          return null;
++        }
++      }
++      let price = priceHint && priceHint > 0 ? priceHint : 0;
++
++      if (price <= 0) {
++        if (isCrypto) {
++          const snapshot = await alpaca.marketData.getCryptoSnapshot(promptSymbol).catch(() => null);
++          price = snapshot?.latest_trade?.price || 0;
++        } else {
++          const quote = await alpaca.marketData.getQuote(promptSymbol).catch(() => null);
++          price = quote?.ask_price || quote?.bid_price || 0;
++        }
++      }
+ 
+-      const prompt = `Should we BUY this stock based on social sentiment and fundamentals?
++      if (price <= 0) {
++        this.log("SignalResearch", "price_unavailable", { symbol: promptSymbol, isCrypto });
++      }
+ 
+-SYMBOL: ${symbol}
++
++       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
++
++SYMBOL: ${promptSymbol}
+ SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
+ 
+ CURRENT DATA:
+-- Price: $${price}
++- Price: ${price > 0 ? `$${price}` : "unavailable"}
+ 
+ Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
+ 
+@@ -1492,7 +1649,7 @@ JSON response:
+       };
+ 
+       const result: ResearchResult = {
+-        symbol,
++        symbol: promptSymbol,
+         verdict: analysis.verdict,
+         confidence: analysis.confidence,
+         entry_quality: analysis.entry_quality,
+@@ -1502,7 +1659,7 @@ JSON response:
+         timestamp: Date.now(),
+       };
+ 
+-      this.state.signalResearch[symbol] = result;
++      this.state.signalResearch[cacheKey] = result;
+       this.log("SignalResearch", "signal_researched", {
+         symbol,
+         verdict: result.verdict,
+@@ -1556,18 +1713,27 @@ JSON response:
+ 
+     this.log("SignalResearch", "researching_signals", { count: candidates.length });
+ 
+-    const aggregated = new Map<string, { symbol: string; sentiment: number; sources: string[] }>();
++    const aggregated = new Map<string, { symbol: string; sentiment: number; sources: string[]; price?: number }>();
+     for (const sig of candidates) {
+       if (!aggregated.has(sig.symbol)) {
+-        aggregated.set(sig.symbol, { symbol: sig.symbol, sentiment: sig.sentiment, sources: [sig.source] });
++        aggregated.set(sig.symbol, {
++          symbol: sig.symbol,
++          sentiment: sig.sentiment,
++          sources: [sig.source],
++          price: sig.price,
++        });
+       } else {
+-        aggregated.get(sig.symbol)!.sources.push(sig.source);
++        const entry = aggregated.get(sig.symbol)!;
++        entry.sources.push(sig.source);
++        if (sig.price && sig.price > 0) {
++          entry.price = sig.price;
++        }
+       }
+     }
+ 
+     const results: ResearchResult[] = [];
+     for (const [symbol, data] of aggregated) {
+-      const analysis = await this.researchSignal(symbol, data.sentiment, data.sources);
++      const analysis = await this.researchSignal(symbol, data.sentiment, data.sources, data.price);
+       if (analysis) {
+         results.push(analysis);
+       }
+@@ -1872,11 +2038,11 @@ Response format:
+           }
+         }
+ 
+-        const result = await this.executeBuy(alpaca, research.symbol, finalConfidence, account);
+-        if (result) {
+-          heldSymbols.add(research.symbol);
+-          this.state.positionEntries[research.symbol] = {
+-            symbol: research.symbol,
++        const resultSymbol = await this.executeBuy(alpaca, research.symbol, finalConfidence, account);
++        if (resultSymbol) {
++          heldSymbols.add(resultSymbol);
++          this.state.positionEntries[resultSymbol] = {
++            symbol: resultSymbol,
+             entry_time: Date.now(),
+             entry_price: 0,
+             entry_sentiment: originalSignal?.sentiment || finalConfidence,
+@@ -1899,12 +2065,12 @@ Response format:
+           if (heldSymbols.has(rec.symbol)) continue;
+           if (researchedSymbols.has(rec.symbol)) continue;
+ 
+-          const result = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
+-          if (result) {
++          const resultSymbol = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
++          if (resultSymbol) {
+             const originalSignal = this.state.signalCache.find(s => s.symbol === rec.symbol);
+-            heldSymbols.add(rec.symbol);
+-            this.state.positionEntries[rec.symbol] = {
+-              symbol: rec.symbol,
++            heldSymbols.add(resultSymbol);
++            this.state.positionEntries[resultSymbol] = {
++              symbol: resultSymbol,
+               entry_time: Date.now(),
+               entry_price: 0,
+               entry_sentiment: originalSignal?.sentiment || rec.confidence,
+@@ -1920,12 +2086,76 @@ Response format:
+     }
+   }
+ 
++  private buildCryptoSymbolMap(): Map<string, string> {
++    return buildCryptoSymbolMap(this.state.config.crypto_symbols);
++  }
++
++  private async resolveAssetClass(
++    alpaca: ReturnType<typeof createAlpacaProviders>,
++    symbol: string
++  ): Promise<{ symbol: string; isCrypto: boolean; asset: Asset | null }> {
++    const normalized = normalizeSymbol(symbol);
++    let asset: Asset | null = null;
++
++    if (normalized.includes("/")) {
++      asset = await alpaca.trading.getAsset(normalized).catch(() => null);
++      if (!asset) {
++        const compact = normalized.replace("/", "");
++        asset = await alpaca.trading.getAsset(compact).catch(() => null);
++      }
++      if (asset?.class === "crypto") {
++        return { symbol: normalizeSymbol(asset.symbol), isCrypto: true, asset };
++      }
++      return { symbol: normalized, isCrypto: true, asset };
++    }
++
++    const cryptoMap = this.buildCryptoSymbolMap();
++    const mapped = cryptoMap.get(normalized);
++    if (mapped) {
++      asset = await alpaca.trading.getAsset(mapped).catch(() => null);
++      if (!asset) {
++        const compact = mapped.replace("/", "");
++        asset = await alpaca.trading.getAsset(compact).catch(() => null);
++      }
++      if (asset?.class === "crypto") {
++        return { symbol: normalizeSymbol(asset.symbol), isCrypto: true, asset };
++      }
++      return { symbol: mapped, isCrypto: true, asset };
++    }
++
++    try {
++      asset = await alpaca.trading.getAsset(normalized);
++      if (asset?.class === "crypto") {
++        return { symbol: normalizeSymbol(asset.symbol), isCrypto: true, asset };
++      }
++      if (asset) {
++        return { symbol: normalizeSymbol(asset.symbol), isCrypto: false, asset };
++      }
++    } catch {
++      // Best-effort lookup; fall back to heuristics below.
++    }
++
++    const slashUsd = toSlashUsdSymbol(normalized);
++    if (slashUsd && slashUsd !== normalized) {
++      try {
++        asset = await alpaca.trading.getAsset(slashUsd);
++        if (asset?.class === "crypto") {
++          return { symbol: normalizeSymbol(asset.symbol), isCrypto: true, asset };
++        }
++      } catch {
++        // Ignore secondary lookup failures.
++      }
++    }
++
++    return { symbol: normalized, isCrypto: false, asset };
++  }
++
+   private async executeBuy(
+     alpaca: ReturnType<typeof createAlpacaProviders>,
+     symbol: string,
+     confidence: number,
+     account: Account
+-  ): Promise<boolean> {
++  ): Promise<string | null> {
+     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+     const positionSize = Math.min(
+       account.cash * (sizePct / 100) * confidence,
+@@ -1934,23 +2164,25 @@ Response format:
+     
+     if (positionSize < 100) {
+       this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
+-      return false;
++      return null;
+     }
+     
+     try {
++      const resolved = await this.resolveAssetClass(alpaca, symbol);
++      const orderSymbol = resolved.symbol;
+       const order = await alpaca.trading.createOrder({
+-        symbol,
++        symbol: orderSymbol,
+         notional: Math.round(positionSize * 100) / 100,
+         side: "buy",
+         type: "market",
+-        time_in_force: "day",
++        time_in_force: resolved.isCrypto ? "gtc" : "day",
+       });
+       
+-      this.log("Executor", "buy_executed", { symbol, status: order.status, size: positionSize });
+-      return true;
++      this.log("Executor", "buy_executed", { symbol: orderSymbol, status: order.status, size: positionSize });
++      return orderSymbol;
+     } catch (error) {
+       this.log("Executor", "buy_failed", { symbol, error: String(error) });
+-      return false;
++      return null;
+     }
+   }
+ 
+@@ -1975,6 +2207,37 @@ Response format:
+     }
+   }
+ 
++  private async closePositionWithFallback(
++    alpaca: ReturnType<typeof createAlpacaProviders>,
++    symbols: string[],
++    reason: string
++  ): Promise<{ ok: boolean; symbol?: string; error?: string }> {
++    let lastError: string | undefined;
++
++    for (const candidate of symbols) {
++      if (!candidate) continue;
++      try {
++        await alpaca.trading.closePosition(candidate);
++        this.log("Executor", "sell_executed", { symbol: candidate, reason });
++
++        for (const key of symbols) {
++          delete this.state.positionEntries[key];
++          delete this.state.socialHistory[key];
++          delete this.state.stalenessAnalysis[key];
++        }
++
++        return { ok: true, symbol: candidate };
++      } catch (error) {
++        lastError = String(error);
++      }
++    }
++
++    if (lastError) {
++      this.log("Executor", "sell_failed", { symbol: symbols[0] ?? "unknown", error: lastError });
++    }
++    return { ok: false, error: lastError || "Close failed" };
++  }
++
+   // ============================================================================
+   // SECTION 8: STALENESS DETECTION
+   // ============================================================================
+@@ -2374,13 +2637,13 @@ Response format:
+         if (heldSymbols.has(rec.symbol)) continue;
+         if (positions.length >= this.state.config.max_positions) break;
+ 
+-        const result = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
+-        if (result) {
+-          heldSymbols.add(rec.symbol);
++        const resultSymbol = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
++        if (resultSymbol) {
++          heldSymbols.add(resultSymbol);
+ 
+           const originalSignal = this.state.signalCache.find(s => s.symbol === rec.symbol);
+-          this.state.positionEntries[rec.symbol] = {
+-            symbol: rec.symbol,
++          this.state.positionEntries[resultSymbol] = {
++            symbol: resultSymbol,
+             entry_time: Date.now(),
+             entry_price: 0,
+             entry_sentiment: originalSignal?.sentiment || 0,
+diff --git a/src/mcp/agent.ts b/src/mcp/agent.ts
+index 296c227..893e7f2 100644
+--- a/src/mcp/agent.ts
++++ b/src/mcp/agent.ts
+@@ -38,6 +38,7 @@ import { classifyEvent, generateResearchReport, summarizeLearnedRules } from "..
+ import { getDTE } from "../providers/alpaca/options";
+ import type { LLMProvider, OptionsProvider } from "../providers/types";
+ import type { OptionsOrderPreview } from "./types";
++import { normalizeSymbol, toSlashUsdSymbol } from "../utils/symbols";
+ 
+ export class MahoragaMcpAgent extends McpAgent<Env> {
+   server = new McpServer({
+@@ -292,6 +293,31 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
+   }
+ 
+   private registerOrderTools(db: ReturnType<typeof createD1Client>, alpaca: ReturnType<typeof createAlpacaProviders>) {
++    const resolveAssetClass = async (symbol: string): Promise<{
++      assetClass: "crypto" | "us_equity";
++      symbol: string;
++    }> => {
++      const normalized = normalizeSymbol(symbol);
++      let asset = await alpaca.trading.getAsset(normalized).catch(() => null);
++
++      if (!asset && !normalized.includes("/")) {
++        const slashUsd = toSlashUsdSymbol(normalized);
++        if (slashUsd && slashUsd !== normalized) {
++          asset = await alpaca.trading.getAsset(slashUsd).catch(() => null);
++        }
++      }
++
++      if (asset?.class === "crypto") {
++        return { assetClass: "crypto", symbol: normalizeSymbol(asset.symbol) };
++      }
++
++      if (normalized.includes("/")) {
++        return { assetClass: "crypto", symbol: normalized };
++      }
++
++      return { assetClass: "us_equity", symbol: normalized };
++    };
++
+     this.server.tool(
+       "orders-preview",
+       "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
+@@ -319,40 +345,36 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
+             getRiskState(db),
+           ]);
+ 
++          const resolved = await resolveAssetClass(input.symbol);
++
+           let estimatedPrice = input.limit_price ?? input.stop_price;
+           if (!estimatedPrice) {
+-            try {
+-              const quote = await alpaca.marketData.getQuote(input.symbol);
+-              estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
+-            } catch { estimatedPrice = 0; }
++            if (resolved.assetClass === "us_equity") {
++              try {
++                const quote = await alpaca.marketData.getQuote(resolved.symbol);
++                estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
++              } catch { estimatedPrice = 0; }
++            } else {
++              estimatedPrice = 0;
++            }
+           }
+ 
+           const estimatedCost = input.notional ?? (input.qty ?? 0) * estimatedPrice;
+-
+-          // Determine asset class via API lookup, with fallback to symbol pattern
+-          let assetClass: "crypto" | "us_equity" = "us_equity";
+-          try {
+-            const asset = await alpaca.trading.getAsset(input.symbol);
+-            if (asset?.class === "crypto") {
+-              assetClass = "crypto";
+-            }
+-          } catch {
+-            // Fallback: crypto symbols contain "/" (e.g., BTC/USD)
+-            if (input.symbol.includes("/")) {
+-              assetClass = "crypto";
+-            }
++          let effectiveTimeInForce = input.time_in_force;
++          if (resolved.assetClass === "crypto" && !["gtc", "ioc"].includes(effectiveTimeInForce)) {
++            effectiveTimeInForce = "gtc";
+           }
+ 
+           const preview = {
+-            symbol: input.symbol.toUpperCase(),
+-            asset_class: assetClass,
++            symbol: resolved.symbol,
++            asset_class: resolved.assetClass,
+             side: input.side,
+             qty: input.qty,
+             notional: input.notional,
+             order_type: input.order_type,
+             limit_price: input.limit_price,
+             stop_price: input.stop_price,
+-            time_in_force: input.time_in_force,
++            time_in_force: effectiveTimeInForce,
+             estimated_price: estimatedPrice,
+             estimated_cost: estimatedCost,
+           };
+@@ -410,7 +432,8 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
+ 
+           const orderParams = validation.order_params!;
+           const clock = await alpaca.trading.getClock();
+-          if (!clock.is_open && orderParams.time_in_force === "day") {
++          const isCrypto = orderParams.asset_class === "crypto";
++          if (!isCrypto && !clock.is_open && orderParams.time_in_force === "day") {
+             return { content: [{ type: "text" as const, text: JSON.stringify(failure({ code: ErrorCode.MARKET_CLOSED, message: "Market closed" }), null, 2) }], isError: true };
+           }
+ 
+diff --git a/src/providers/alpaca/market-data.ts b/src/providers/alpaca/market-data.ts
+index 700f703..8cfeaf3 100644
+--- a/src/providers/alpaca/market-data.ts
++++ b/src/providers/alpaca/market-data.ts
+@@ -149,24 +149,87 @@ export class AlpacaMarketDataProvider implements MarketDataProvider {
+   }
+ 
+   async getQuote(symbol: string): Promise<Quote> {
+-    const response = await this.client.dataRequest<AlpacaQuotesResponse>(
+-      "GET",
+-      `/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`
+-    );
++    const path = `/v2/stocks/${encodeURIComponent(symbol)}/quotes/latest`;
++    try {
++      const response = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path);
++      const quote = response.quotes[symbol];
++      if (quote) {
++        return parseQuote(symbol, quote);
++      }
++    } catch {
++      // Fall through to IEX fallback.
++    }
+ 
+-    const quote = response.quotes[symbol];
++    const fallback = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path, { feed: "iex" });
++    const quote = fallback.quotes[symbol];
+     if (!quote) {
++      try {
++        const snapshot = await this.getSnapshot(symbol);
++        if (snapshot.latest_quote) {
++          return snapshot.latest_quote;
++        }
++        const tradePrice = snapshot.latest_trade?.price;
++        if (tradePrice) {
++          return {
++            symbol,
++            bid_price: tradePrice,
++            bid_size: snapshot.latest_trade?.size ?? 0,
++            ask_price: tradePrice,
++            ask_size: snapshot.latest_trade?.size ?? 0,
++            timestamp: snapshot.latest_trade?.timestamp ?? new Date().toISOString(),
++          };
++        }
++      } catch {
++        // Fall through to bar fallback.
++      }
++
++      try {
++        const barResponse = await this.client.dataRequest<AlpacaLatestBarsResponse>(
++          "GET",
++          `/v2/stocks/${encodeURIComponent(symbol)}/bars/latest`,
++          { feed: "iex" }
++        );
++        const bar = barResponse.bars[symbol];
++        if (bar) {
++          return {
++            symbol,
++            bid_price: bar.c,
++            bid_size: 0,
++            ask_price: bar.c,
++            ask_size: 0,
++            timestamp: bar.t,
++          };
++        }
++      } catch {
++        // Ignore bar fallback errors.
++      }
++
+       throw new Error(`No quote data for ${symbol}`);
+     }
+     return parseQuote(symbol, quote);
+   }
+ 
+   async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
+-    const response = await this.client.dataRequest<AlpacaQuotesResponse>(
+-      "GET",
+-      "/v2/stocks/quotes/latest",
+-      { symbols: symbols.join(",") }
+-    );
++    const path = "/v2/stocks/quotes/latest";
++    let response: AlpacaQuotesResponse | null = null;
++
++    try {
++      response = await this.client.dataRequest<AlpacaQuotesResponse>(
++        "GET",
++        path,
++        { symbols: symbols.join(",") }
++      );
++    } catch {
++      response = null;
++    }
++
++    if (!response || Object.keys(response.quotes ?? {}).length === 0) {
++      response = await this.client.dataRequest<AlpacaQuotesResponse>(
++        "GET",
++        path,
++        { symbols: symbols.join(","), feed: "iex" }
++      );
++    }
+ 
+     const result: Record<string, Quote> = {};
+     for (const [symbol, quote] of Object.entries(response.quotes)) {
+diff --git a/src/utils/symbols.ts b/src/utils/symbols.ts
+new file mode 100644
+index 0000000..9e7d653
+--- /dev/null
++++ b/src/utils/symbols.ts
+@@ -0,0 +1,32 @@
++export function normalizeSymbol(symbol: string): string {
++  return symbol.trim().toUpperCase();
++}
++
++export function cryptoSymbolKey(symbol: string): string {
++  return normalizeSymbol(symbol).replace("/", "");
++}
++
++export function buildCryptoSymbolMap(cryptoSymbols?: string[]): Map<string, string> {
++  const map = new Map<string, string>();
++  for (const symbol of cryptoSymbols ?? []) {
++    const normalized = normalizeSymbol(symbol);
++    map.set(normalized.replace("/", ""), normalized);
++  }
++  return map;
++}
++
++export function normalizeCryptoSymbol(symbol: string, cryptoSymbols?: string[]): string {
++  const normalized = normalizeSymbol(symbol);
++  if (normalized.includes("/")) return normalized;
++  const map = buildCryptoSymbolMap(cryptoSymbols);
++  return map.get(normalized) ?? normalized;
++}
++
++export function toSlashUsdSymbol(symbol: string): string | null {
++  const normalized = normalizeSymbol(symbol);
++  if (normalized.includes("/")) return normalized;
++  if (normalized.endsWith("USD") && normalized.length > 3) {
++    return `${normalized.slice(0, -3)}/USD`;
++  }
++  return null;
++}
+diff --git a/wrangler.jsonc b/wrangler.jsonc
+index 4239c9a..404396b 100644
+--- a/wrangler.jsonc
++++ b/wrangler.jsonc
+@@ -1,96 +1,92 @@
+ {
+-  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+-  "name": "mahoraga",
+-  "main": "src/index.ts",
+-  "compatibility_date": "2024-12-01",
+-  "compatibility_flags": ["nodejs_compat"],
+-
+-  "vars": {
+-    "ENVIRONMENT": "production",
+-    "FEATURE_LLM_RESEARCH": "true",
+-    "FEATURE_OPTIONS": "true",
+-    "DEFAULT_MAX_POSITION_PCT": "0.10",
+-    "DEFAULT_MAX_NOTIONAL_PER_TRADE": "5000",
+-    "DEFAULT_MAX_DAILY_LOSS_PCT": "0.02",
+-    "DEFAULT_COOLDOWN_MINUTES": "30",
+-    "DEFAULT_MAX_OPEN_POSITIONS": "10",
+-    "DEFAULT_APPROVAL_TTL_SECONDS": "300"
+-  },
+-
+-  // Secrets (set via `wrangler secret put <NAME>`):
+-  // Required:
+-  // - ALPACA_API_KEY
+-  // - ALPACA_API_SECRET
+-  // - OPENAI_API_KEY
+-  // - MAHORAGA_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
+-  // - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
+-  // Optional:
+-  // - ALPACA_PAPER ("true" for paper trading)
+-  // - TWITTER_BEARER_TOKEN
+-  // - DISCORD_WEBHOOK_URL
+-
+-  "d1_databases": [
+-    {
+-      "binding": "DB",
+-      "database_name": "mahoraga-db",
+-      "database_id": "placeholder-will-be-replaced-after-create",
+-      "migrations_dir": "migrations"
+-    }
+-  ],
+-
+-  "kv_namespaces": [
+-    {
+-      "binding": "CACHE",
+-      "id": "placeholder-will-be-replaced-after-create"
+-    }
+-  ],
+-
+-  "r2_buckets": [
+-    {
+-      "binding": "ARTIFACTS",
+-      "bucket_name": "mahoraga-artifacts"
+-    }
+-  ],
+-
+-  "durable_objects": {
+-    "bindings": [
+-      {
+-        "name": "SESSION",
+-        "class_name": "SessionDO"
+-      },
+-      {
+-        "name": "MCP_AGENT",
+-        "class_name": "MahoragaMcpAgent"
+-      },
+-      {
+-        "name": "MAHORAGA_HARNESS",
+-        "class_name": "MahoragaHarness"
+-      }
+-    ]
+-  },
+-
+-  "migrations": [
+-    {
+-      "tag": "v1",
+-      "new_sqlite_classes": ["SessionDO", "MahoragaMcpAgent", "MahoragaHarness"]
+-    }
+-  ],
+-
+-  "triggers": {
+-    "crons": [
+-      "*/5 13-20 * * 1-5",
+-      "0 14 * * 1-5",
+-      "30 21 * * 1-5",
+-      "0 5 * * *",
+-      "0 * * * *"
+-    ]
+-  },
+-
+-  "build": {
+-    "command": "npm run build"
+-  },
+-
+-  "dev": {
+-    "port": 8787
+-  }
+-}
++	"$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
++	"name": "mahoraga",
++	"main": "src/index.ts",
++	"compatibility_date": "2024-12-01",
++	"compatibility_flags": [
++		"nodejs_compat"
++	],
++	"vars": {
++		"ENVIRONMENT": "production",
++		"FEATURE_LLM_RESEARCH": "true",
++		"FEATURE_OPTIONS": "true",
++		"DEFAULT_MAX_POSITION_PCT": "0.10",
++		"DEFAULT_MAX_NOTIONAL_PER_TRADE": "5000",
++		"DEFAULT_MAX_DAILY_LOSS_PCT": "0.02",
++		"DEFAULT_COOLDOWN_MINUTES": "30",
++		"DEFAULT_MAX_OPEN_POSITIONS": "10",
++		"DEFAULT_APPROVAL_TTL_SECONDS": "300"
++	},
++	// Secrets (set via `wrangler secret put <NAME>`):
++	// Required:
++	// - ALPACA_API_KEY
++	// - ALPACA_API_SECRET
++	// - OPENAI_API_KEY
++	// - MAHORAGA_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
++	// - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
++	// Optional:
++	// - ALPACA_PAPER ("true" for paper trading)
++	// - TWITTER_BEARER_TOKEN
++	// - DISCORD_WEBHOOK_URL
++	"d1_databases": [
++		{
++			"binding": "DB",
++			"database_name": "mahoraga-db",
++			"database_id": "e11bed89-84e7-4769-891d-cb4882b9f1ab",
++			"migrations_dir": "migrations"
++		},
++	],
++	"kv_namespaces": [
++		{
++			"binding": "CACHE",
++			"id": "8233e68c2515440088c4f6f96ca545ff"
++		}
++	],
++	"r2_buckets": [
++		{
++			"binding": "ARTIFACTS",
++			"bucket_name": "mahoraga-artifacts"
++		}
++	],
++	"durable_objects": {
++		"bindings": [
++			{
++				"name": "SESSION",
++				"class_name": "SessionDO"
++			},
++			{
++				"name": "MCP_AGENT",
++				"class_name": "MahoragaMcpAgent"
++			},
++			{
++				"name": "MAHORAGA_HARNESS",
++				"class_name": "MahoragaHarness"
++			}
++		]
++	},
++	"migrations": [
++		{
++			"tag": "v1",
++			"new_sqlite_classes": [
++				"SessionDO",
++				"MahoragaMcpAgent",
++				"MahoragaHarness"
++			]
++		}
++	],
++	"triggers": {
++		"crons": [
++			"*/5 13-20 * * 1-5",
++			"0 14 * * 1-5",
++			"30 21 * * 1-5",
++			"0 5 * * *",
++			"0 * * * *"
++		]
++	},
++	"build": {
++		"command": "npm run build"
++	},
++	"dev": {
++		"port": 8787
++	}
++}
+\ No newline at end of file
+-- 
+2.48.1.windows.1
+

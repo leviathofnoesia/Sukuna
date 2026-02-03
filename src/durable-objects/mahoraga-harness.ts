@@ -39,7 +39,7 @@ import { DurableObject } from "cloudflare:workers";
 import OpenAI from "openai";
 import type { Env } from "../env.d";
 import { createAlpacaProviders } from "../providers/alpaca";
-import type { Account, Position, MarketClock, Asset } from "../providers/types";
+import type { Account, Position, MarketClock, Asset, Snapshot, Bar } from "../providers/types";
 import {
   buildCryptoSymbolMap,
   cryptoSymbolKey,
@@ -112,6 +112,19 @@ interface AgentConfig {
   crypto_min_analyst_confidence: number; // [TUNE] Lower threshold for crypto-only trades
   crypto_universe_top_n: number;   // [TUNE] Use CoinMarketCap top-N (0 disables)
   crypto_universe_refresh_ms: number; // [TUNE] Refresh cadence for top-N universe
+
+  // Manual watchlist - user-specified stock tickers added to signal cache
+  stock_watchlist_symbols: string[];
+
+  // Alpha scan - quantitative filters + edge scoring
+  alpha_scan_enabled: boolean;
+  alpha_scan_interval_ms: number;
+  alpha_scan_max_markets: number;
+  alpha_min_notional_volume: number;
+  alpha_max_spread_pct: number;
+  alpha_min_edge: number;
+  alpha_edge_threshold: number;
+  alpha_bars_lookback: number;
 }
 
 // [CUSTOMIZABLE] Add fields here when you add new data sources
@@ -203,6 +216,25 @@ interface PremarketPlan {
   researched_buys: ResearchResult[];
 }
 
+interface AlphaMarket {
+  symbol: string;
+  isCrypto: boolean;
+  notional_volume: number;
+  spread_pct: number | null;
+  implied_prob: number;
+  calculated_prob: number;
+  alpha: number;
+}
+
+interface AlphaScanState {
+  updated_at: number;
+  total: number;
+  volume_pass: number;
+  liquidity_pass: number;
+  edge_pass: number;
+  top_alpha: AlphaMarket[];
+}
+
 interface AgentState {
   config: AgentConfig;
   signalCache: Signal[];
@@ -222,6 +254,7 @@ interface AgentState {
   premarketPlan: PremarketPlan | null;
   cryptoUniverseSymbols: string[];
   cryptoUniverseUpdatedAt: number;
+  alphaScan: AlphaScanState;
   enabled: boolean;
 }
 
@@ -308,6 +341,15 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_min_analyst_confidence: 0.5,
   crypto_universe_top_n: 100,
   crypto_universe_refresh_ms: 300_000,
+  stock_watchlist_symbols: [],
+  alpha_scan_enabled: true,
+  alpha_scan_interval_ms: 300_000,
+  alpha_scan_max_markets: 1000,
+  alpha_min_notional_volume: 1_000_000,
+  alpha_max_spread_pct: 0.01,
+  alpha_min_edge: 0.08,
+  alpha_edge_threshold: 0.2,
+  alpha_bars_lookback: 60,
 };
 
 const DEFAULT_STATE: AgentState = {
@@ -329,6 +371,14 @@ const DEFAULT_STATE: AgentState = {
   premarketPlan: null,
   cryptoUniverseSymbols: [],
   cryptoUniverseUpdatedAt: 0,
+  alphaScan: {
+    updated_at: 0,
+    total: 0,
+    volume_pass: 0,
+    liquidity_pass: 0,
+    edge_pass: 0,
+    top_alpha: [],
+  },
   enabled: false,
 };
 
@@ -441,7 +491,11 @@ export class MahoragaHarness extends DurableObject<Env> {
     super(ctx, env);
     
     if (env.OPENAI_API_KEY) {
-      this._openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+      const openaiConfig: { apiKey: string; baseURL?: string } = { apiKey: env.OPENAI_API_KEY };
+      if (env.OPENAI_BASE_URL) {
+        openaiConfig.baseURL = env.OPENAI_BASE_URL;
+      }
+      this._openai = new OpenAI(openaiConfig);
       console.log("[MahoragaHarness] OpenAI initialized");
     } else {
       console.log("[MahoragaHarness] WARNING: OPENAI_API_KEY not found - research disabled");
@@ -722,6 +776,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         twitterConfirmations: this.state.twitterConfirmations,
         premarketPlan: this.state.premarketPlan,
         stalenessAnalysis: this.state.stalenessAnalysis,
+        alphaScan: this.state.alphaScan,
         cryptoUniverse: {
           provider: this.env.COINMARKETCAP_API_KEY ? "coinmarketcap" : "coinpaprika",
           enabled: this.state.config.crypto_enabled && (this.state.config.crypto_universe_top_n ?? 0) > 0,
@@ -839,6 +894,7 @@ export class MahoragaHarness extends DurableObject<Env> {
     let stocktwitsSignals: Signal[] = [];
     let redditSignals: Signal[] = [];
     let cryptoSignals: Signal[] = [];
+    const manualSignals = this.buildManualWatchlistSignals();
 
     if (options.scanEquities) {
       [stocktwitsSignals, redditSignals] = await Promise.all([
@@ -851,14 +907,16 @@ export class MahoragaHarness extends DurableObject<Env> {
       cryptoSignals = await this.gatherCrypto();
     }
 
-    const mergedSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals];
+    const mergedSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...manualSignals];
     const filteredSignals = await this.prefilterSignals(mergedSignals);
     this.state.signalCache = filteredSignals;
+    await this.runAlphaScan();
     
     this.log("System", "data_gathered", {
       stocktwits: stocktwitsSignals.length,
       reddit: redditSignals.length,
       crypto: cryptoSignals.length,
+      manual: manualSignals.length,
       total: this.state.signalCache.length,
       filtered_out: mergedSignals.length - filteredSignals.length,
     });
@@ -958,6 +1016,285 @@ export class MahoragaHarness extends DurableObject<Env> {
     }
 
     return filtered;
+  }
+
+  private getManualWatchlistSymbols(): string[] {
+    const symbols = this.state.config.stock_watchlist_symbols ?? [];
+    const unique = new Set(
+      symbols
+        .map((symbol) => normalizeSymbol(symbol))
+        .filter(Boolean)
+    );
+    return Array.from(unique);
+  }
+
+  private buildManualWatchlistSignals(): Signal[] {
+    const symbols = this.getManualWatchlistSymbols();
+    if (symbols.length === 0) return [];
+
+    const baseSentiment = Math.max(0.05, this.state.config.min_sentiment_score * 0.75);
+    return symbols.map((symbol) => ({
+      symbol,
+      source: "manual",
+      source_detail: "manual_watchlist",
+      sentiment: baseSentiment,
+      raw_sentiment: baseSentiment,
+      volume: 0,
+      freshness: 1.0,
+      source_weight: 1.0,
+      reason: "Manual watchlist entry",
+      bullish: 0,
+      bearish: 0,
+    }));
+  }
+
+  private clampProbability(value: number): number {
+    if (!Number.isFinite(value)) return 0.5;
+    return Math.max(0, Math.min(1, value));
+  }
+
+  private computeAvgAbsReturn(bars: Bar[]): number | null {
+    if (bars.length < 2) return null;
+    const returns: number[] = [];
+    for (let i = 1; i < bars.length; i++) {
+      const prevClose = bars[i - 1]!.c;
+      const close = bars[i]!.c;
+      if (!prevClose) continue;
+      returns.push(Math.abs((close - prevClose) / prevClose));
+    }
+    if (returns.length === 0) return null;
+    return returns.reduce((sum, value) => sum + value, 0) / returns.length;
+  }
+
+  private computeUpDaysProbability(bars: Bar[]): number | null {
+    if (bars.length < 2) return null;
+    let upDays = 0;
+    let total = 0;
+    for (let i = 1; i < bars.length; i++) {
+      const prevClose = bars[i - 1]!.c;
+      const close = bars[i]!.c;
+      if (!prevClose) continue;
+      total += 1;
+      if (close > prevClose) {
+        upDays += 1;
+      }
+    }
+    if (total === 0) return null;
+    return upDays / total;
+  }
+
+  private computeImpliedProbability(dailyReturn: number, avgAbsReturn: number): number {
+    if (!Number.isFinite(avgAbsReturn) || avgAbsReturn <= 0) {
+      return 0.5;
+    }
+    const normalized = dailyReturn / (2 * avgAbsReturn);
+    const clamped = Math.max(-0.5, Math.min(0.5, normalized));
+    return this.clampProbability(0.5 + clamped);
+  }
+
+  private async runAlphaScan(): Promise<void> {
+    if (!this.state.config.alpha_scan_enabled) return;
+
+    const now = Date.now();
+    const interval = this.state.config.alpha_scan_interval_ms || 300_000;
+    if (this.state.alphaScan.updated_at && now - this.state.alphaScan.updated_at < interval) {
+      return;
+    }
+
+    const signals = this.state.signalCache;
+    if (signals.length === 0) {
+      this.state.alphaScan = {
+        updated_at: now,
+        total: 0,
+        volume_pass: 0,
+        liquidity_pass: 0,
+        edge_pass: 0,
+        top_alpha: [],
+      };
+      return;
+    }
+
+    const aggregated = new Map<string, { symbol: string; isCrypto: boolean; sentiment: number; count: number }>();
+    for (const sig of signals) {
+      const symbol = normalizeSymbol(sig.symbol);
+      const existing = aggregated.get(symbol);
+      if (existing) {
+        existing.sentiment += sig.sentiment;
+        existing.count += 1;
+      } else {
+        aggregated.set(symbol, {
+          symbol,
+          isCrypto: !!sig.isCrypto,
+          sentiment: sig.sentiment,
+          count: 1,
+        });
+      }
+    }
+
+    const maxMarkets = this.state.config.alpha_scan_max_markets || 1000;
+    const markets = Array.from(aggregated.values())
+      .map((entry) => ({
+        symbol: entry.symbol,
+        isCrypto: entry.isCrypto,
+        sentimentAvg: entry.sentiment / entry.count,
+      }))
+      .sort((a, b) => b.sentimentAvg - a.sentimentAvg)
+      .slice(0, maxMarkets);
+
+    if (markets.length === 0) {
+      this.state.alphaScan = {
+        updated_at: now,
+        total: 0,
+        volume_pass: 0,
+        liquidity_pass: 0,
+        edge_pass: 0,
+        top_alpha: [],
+      };
+      return;
+    }
+
+    const alpaca = createAlpacaProviders(this.env);
+    const snapshots = new Map<string, Snapshot>();
+    const equitySymbols = markets.filter((m) => !m.isCrypto).map((m) => m.symbol);
+
+    const snapshotChunkSize = 100;
+    for (let i = 0; i < equitySymbols.length; i += snapshotChunkSize) {
+      const chunk = equitySymbols.slice(i, i + snapshotChunkSize);
+      try {
+        const batch = await alpaca.marketData.getSnapshots(chunk);
+        for (const [symbol, snap] of Object.entries(batch)) {
+          snapshots.set(normalizeSymbol(symbol), snap);
+        }
+      } catch (error) {
+        this.log("Alpha", "snapshot_batch_failed", { count: chunk.length, error: String(error) });
+      }
+    }
+
+    for (const market of markets.filter((m) => m.isCrypto)) {
+      try {
+        const snap = await alpaca.marketData.getCryptoSnapshot(market.symbol);
+        snapshots.set(normalizeSymbol(market.symbol), snap);
+      } catch (error) {
+        this.log("Alpha", "snapshot_failed", { symbol: market.symbol, error: String(error) });
+      }
+    }
+
+    const minNotional = this.state.config.alpha_min_notional_volume || 0;
+    const maxSpread = this.state.config.alpha_max_spread_pct || 0.02;
+    const minEdge = this.state.config.alpha_min_edge || 0.08;
+    const edgeThreshold = this.state.config.alpha_edge_threshold || 0.2;
+    const lookback = this.state.config.alpha_bars_lookback || 60;
+
+    const volumePass: typeof markets = [];
+    const liquidityPass: typeof markets = [];
+    const edgePass: AlphaMarket[] = [];
+
+    for (const market of markets) {
+      const snapshot = snapshots.get(market.symbol);
+      if (!snapshot) continue;
+
+      const price = snapshot.latest_trade?.price || snapshot.daily_bar?.c || 0;
+      const volume = snapshot.daily_bar?.v || 0;
+      const notional = price * volume;
+
+      if (notional < minNotional) continue;
+      volumePass.push(market);
+
+      const bid = snapshot.latest_quote?.bid_price || 0;
+      const ask = snapshot.latest_quote?.ask_price || 0;
+      let spreadPct: number | null = null;
+      if (bid > 0 && ask > 0) {
+        const mid = (bid + ask) / 2;
+        if (mid > 0) {
+          spreadPct = (ask - bid) / mid;
+        }
+      }
+
+      if (spreadPct === null || spreadPct > maxSpread) continue;
+      liquidityPass.push(market);
+    }
+
+    for (const market of liquidityPass) {
+      const snapshot = snapshots.get(market.symbol);
+      if (!snapshot) continue;
+
+      const price = snapshot.latest_trade?.price || snapshot.daily_bar?.c || 0;
+      const volume = snapshot.daily_bar?.v || 0;
+      const notional = price * volume;
+      const bid = snapshot.latest_quote?.bid_price || 0;
+      const ask = snapshot.latest_quote?.ask_price || 0;
+      const mid = (bid + ask) / 2;
+      const spreadPct = mid > 0 ? (ask - bid) / mid : null;
+
+      const prevClose = snapshot.prev_daily_bar?.c || 0;
+      const close = snapshot.daily_bar?.c || 0;
+      const dailyReturn = prevClose ? (close - prevClose) / prevClose : 0;
+
+      let avgAbsReturn = Math.max(Math.abs(dailyReturn), 0.02);
+      let calcProb = this.clampProbability(market.sentimentAvg);
+
+      if (!market.isCrypto) {
+        try {
+          const bars = await alpaca.marketData.getBars(market.symbol, "1Day", { limit: lookback });
+          const barAvgAbs = this.computeAvgAbsReturn(bars);
+          const upDaysProb = this.computeUpDaysProbability(bars);
+          if (barAvgAbs !== null) {
+            avgAbsReturn = barAvgAbs;
+          }
+          if (upDaysProb !== null) {
+            calcProb = this.clampProbability(0.6 * calcProb + 0.4 * upDaysProb);
+          }
+        } catch (error) {
+          this.log("Alpha", "bars_failed", { symbol: market.symbol, error: String(error) });
+        }
+      }
+
+      const impliedProb = this.computeImpliedProbability(dailyReturn, avgAbsReturn);
+      const alpha = calcProb - impliedProb;
+
+      if (Math.abs(alpha) < minEdge) continue;
+
+      edgePass.push({
+        symbol: market.symbol,
+        isCrypto: market.isCrypto,
+        notional_volume: notional,
+        spread_pct: spreadPct,
+        implied_prob: impliedProb,
+        calculated_prob: calcProb,
+        alpha,
+      });
+    }
+
+    const topAlpha = edgePass
+      .filter((m) => m.alpha >= edgeThreshold)
+      .sort((a, b) => b.alpha - a.alpha)
+      .slice(0, 10);
+
+    for (const market of topAlpha) {
+      this.log("Alpha", "top_alpha_detected", {
+        symbol: market.symbol,
+        alpha: Number(market.alpha.toFixed(4)),
+        implied_prob: Number(market.implied_prob.toFixed(3)),
+        calculated_prob: Number(market.calculated_prob.toFixed(3)),
+      });
+    }
+
+    this.state.alphaScan = {
+      updated_at: now,
+      total: markets.length,
+      volume_pass: volumePass.length,
+      liquidity_pass: liquidityPass.length,
+      edge_pass: edgePass.length,
+      top_alpha: topAlpha,
+    };
+
+    this.log("Alpha", "scan_complete", {
+      total: markets.length,
+      volume_pass: volumePass.length,
+      liquidity_pass: liquidityPass.length,
+      edge_pass: edgePass.length,
+      top_alpha: topAlpha.length,
+    });
   }
 
   private async gatherStockTwits(): Promise<Signal[]> {
@@ -1141,8 +1478,13 @@ export class MahoragaHarness extends DurableObject<Env> {
     const signals: Signal[] = [];
     const symbols = this.getActiveCryptoSymbols();
     const alpaca = createAlpacaProviders(this.env);
+    let stablecoinExcluded = 0;
     
     for (const symbol of symbols) {
+      if (this.isStablecoinSymbol(symbol)) {
+        stablecoinExcluded += 1;
+        continue;
+      }
       try {
         const snapshot = await alpaca.marketData.getCryptoSnapshot(symbol);
         if (!snapshot) continue;
@@ -1182,7 +1524,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
     }
     
-    this.log("Crypto", "gathered_signals", { count: signals.length });
+    this.log("Crypto", "gathered_signals", { count: signals.length, stablecoin_excluded: stablecoinExcluded });
     return signals;
   }
 
@@ -1216,13 +1558,27 @@ export class MahoragaHarness extends DurableObject<Env> {
     }
     
     const maxCryptoPositions = Math.min(activeCryptoSymbols.length || 3, 3);
-    if (cryptoPositions.length >= maxCryptoPositions) return;
+    if (cryptoPositions.length >= maxCryptoPositions) {
+      this.log("Crypto", "entry_skipped_max_positions", {
+        held: cryptoPositions.length,
+        max: maxCryptoPositions,
+      });
+      return;
+    }
     
     const cryptoSignals = this.state.signalCache
       .filter(s => s.isCrypto)
       .filter(s => !heldCrypto.has(cryptoSymbolKey(s.symbol)))
       .filter(s => s.sentiment > 0)
       .sort((a, b) => (b.momentum || 0) - (a.momentum || 0));
+
+    if (cryptoSignals.length === 0) {
+      this.log("Crypto", "entry_skipped_no_signals", {
+        total_signals: this.state.signalCache.length,
+        held_crypto: heldCrypto.size,
+      });
+      return;
+    }
     
     const now = Date.now();
     const CRYPTO_RESEARCH_TTL_MS = 300_000;
@@ -1246,17 +1602,19 @@ export class MahoragaHarness extends DurableObject<Env> {
       }
       
       if (!research || research.verdict !== "BUY") {
-        this.log("Crypto", "research_skip", { 
-          symbol: signal.symbol, 
+        this.log("Crypto", "research_skip", {
+          symbol: signal.symbol,
+          reason: research ? "verdict_not_buy" : "no_research",
           verdict: research?.verdict || "NO_RESEARCH",
-          confidence: research?.confidence || 0 
+          confidence: research?.confidence || 0,
         });
         continue;
       }
       
       const cryptoMinConfidence = this.state.config.crypto_min_analyst_confidence ?? this.state.config.min_analyst_confidence;
       if (research.confidence < cryptoMinConfidence) {
-        this.log("Crypto", "low_confidence", {
+        this.log("Crypto", "research_skip", {
+          reason: "below_threshold",
           symbol: signal.symbol,
           confidence: research.confidence,
           required: cryptoMinConfidence,
@@ -1788,10 +2146,13 @@ JSON response:
   private async researchTopSignals(limit = 5): Promise<ResearchResult[]> {
     const alpaca = createAlpacaProviders(this.env);
     const positions = await alpaca.trading.getPositions();
-    const heldSymbols = new Set(positions.map(p => p.symbol));
+    const heldSymbols = new Set<string>();
+    for (const position of positions) {
+      this.addHeldSymbol(heldSymbols, position.symbol);
+    }
 
     const allSignals = this.state.signalCache;
-    const notHeld = allSignals.filter(s => !heldSymbols.has(s.symbol));
+    const notHeld = allSignals.filter(s => !heldSymbols.has(normalizeSymbol(s.symbol)));
     // Use raw_sentiment for threshold (before weighting), weighted sentiment for sorting
     const aboveThreshold = notHeld.filter(s => s.raw_sentiment >= this.state.config.min_sentiment_score);
     const candidates = aboveThreshold
@@ -2065,7 +2426,10 @@ Response format:
       return;
     }
     
-    const heldSymbols = new Set(positions.map(p => p.symbol));
+    const heldSymbols = new Set<string>();
+    for (const position of positions) {
+      this.addHeldSymbol(heldSymbols, position.symbol);
+    }
     
     // Check position exits
     for (const pos of positions) {
@@ -2097,14 +2461,29 @@ Response format:
     }
     
     if (positions.length < this.state.config.max_positions && this.state.signalCache.length > 0) {
-      const researchedBuys = Object.values(this.state.signalResearch)
-        .filter(r => r.verdict === "BUY" && r.confidence >= this.state.config.min_analyst_confidence)
-        .filter(r => !heldSymbols.has(r.symbol))
+      const minConfidence = this.state.config.min_analyst_confidence;
+      const allResearch = Object.values(this.state.signalResearch);
+      const buyResearch = allResearch.filter(r => r.verdict === "BUY");
+      const buyAbove = buyResearch.filter(r => r.confidence >= minConfidence);
+      const buyBelow = buyResearch.filter(r => r.confidence < minConfidence);
+      const buyHeld = buyAbove.filter(r => heldSymbols.has(normalizeSymbol(r.symbol)));
+
+      this.log("System", "entry_research_summary", {
+        total_research: allResearch.length,
+        buy_verdict: buyResearch.length,
+        buy_above_threshold: buyAbove.length,
+        buy_below_threshold: buyBelow.length,
+        buy_held: buyHeld.length,
+        threshold: minConfidence,
+      });
+
+      const researchedBuys = buyAbove
+        .filter(r => !heldSymbols.has(normalizeSymbol(r.symbol)))
         .sort((a, b) => b.confidence - a.confidence);
 
       for (const research of researchedBuys.slice(0, 3)) {
         if (positions.length >= this.state.config.max_positions) break;
-        if (heldSymbols.has(research.symbol)) continue;
+        if (heldSymbols.has(normalizeSymbol(research.symbol))) continue;
 
         const originalSignal = this.state.signalCache.find(s => s.symbol === research.symbol);
         let finalConfidence = research.confidence;
@@ -2119,7 +2498,14 @@ Response format:
           }
         }
 
-        if (finalConfidence < this.state.config.min_analyst_confidence) continue;
+        if (finalConfidence < minConfidence) {
+          this.log("System", "entry_skipped_low_confidence", {
+            symbol: research.symbol,
+            confidence: finalConfidence,
+            required: minConfidence,
+          });
+          continue;
+        }
 
         const shouldUseOptions = this.isOptionsEnabled() &&
           finalConfidence >= this.state.config.options_min_confidence &&
@@ -2137,7 +2523,8 @@ Response format:
 
         const resultSymbol = await this.executeBuy(alpaca, research.symbol, finalConfidence, account);
         if (resultSymbol) {
-          heldSymbols.add(resultSymbol);
+          this.addHeldSymbol(heldSymbols, resultSymbol);
+          this.addHeldSymbol(heldSymbols, research.symbol);
           this.state.positionEntries[resultSymbol] = {
             symbol: resultSymbol,
             entry_time: Date.now(),
@@ -2154,18 +2541,48 @@ Response format:
 
       if (positions.length < this.state.config.max_positions) {
         const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
-        const researchedSymbols = new Set(researchedBuys.map(r => r.symbol));
+        const researchedSymbols = new Set(researchedBuys.map(r => normalizeSymbol(r.symbol)));
 
         for (const rec of analysis.recommendations) {
           if (positions.length >= this.state.config.max_positions) break;
-          if (rec.action !== "BUY" || rec.confidence < this.state.config.min_analyst_confidence) continue;
-          if (heldSymbols.has(rec.symbol)) continue;
-          if (researchedSymbols.has(rec.symbol)) continue;
+          if (rec.action !== "BUY") {
+            this.log("System", "analyst_rec_skip", {
+              symbol: rec.symbol,
+              reason: "action_not_buy",
+              action: rec.action,
+              confidence: rec.confidence,
+            });
+            continue;
+          }
+          if (rec.confidence < minConfidence) {
+            this.log("System", "analyst_rec_skip", {
+              symbol: rec.symbol,
+              reason: "below_threshold",
+              confidence: rec.confidence,
+              required: minConfidence,
+            });
+            continue;
+          }
+          if (heldSymbols.has(normalizeSymbol(rec.symbol))) {
+            this.log("System", "analyst_rec_skip", {
+              symbol: rec.symbol,
+              reason: "already_held",
+            });
+            continue;
+          }
+          if (researchedSymbols.has(normalizeSymbol(rec.symbol))) {
+            this.log("System", "analyst_rec_skip", {
+              symbol: rec.symbol,
+              reason: "already_researched",
+            });
+            continue;
+          }
 
           const resultSymbol = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
           if (resultSymbol) {
             const originalSignal = this.state.signalCache.find(s => s.symbol === rec.symbol);
-            heldSymbols.add(resultSymbol);
+            this.addHeldSymbol(heldSymbols, resultSymbol);
+            this.addHeldSymbol(heldSymbols, rec.symbol);
             this.state.positionEntries[resultSymbol] = {
               symbol: resultSymbol,
               entry_time: Date.now(),
@@ -2180,6 +2597,14 @@ Response format:
           }
         }
       }
+    }
+    if (positions.length >= this.state.config.max_positions) {
+      this.log("System", "entry_skipped_max_positions", {
+        held: positions.length,
+        max: this.state.config.max_positions,
+      });
+    } else if (this.state.signalCache.length === 0) {
+      this.log("System", "entry_skipped_no_signals", { reason: "Signal cache empty" });
     }
   }
 
@@ -2204,6 +2629,35 @@ Response format:
       return normalized.slice(0, -3);
     }
     return normalized;
+  }
+
+  private isStablecoinSymbol(symbol: string): boolean {
+    const base = this.getCryptoBaseSymbol(symbol);
+    const stablecoins = new Set([
+      "USDT",
+      "USDC",
+      "USDG",
+      "DAI",
+      "BUSD",
+      "TUSD",
+      "USDP",
+      "GUSD",
+      "FDUSD",
+      "USDD",
+      "USDE",
+      "EURC",
+      "PYUSD",
+    ]);
+    return stablecoins.has(base);
+  }
+
+  private addHeldSymbol(heldSymbols: Set<string>, symbol: string): void {
+    const normalized = normalizeSymbol(symbol);
+    heldSymbols.add(normalized);
+    const base = this.getCryptoBaseSymbol(normalized);
+    if (base !== normalized) {
+      heldSymbols.add(base);
+    }
   }
 
   private async refreshCryptoUniverse(
@@ -2854,7 +3308,10 @@ Response format:
 
     if (!account) return;
 
-    const heldSymbols = new Set(positions.map(p => p.symbol));
+    const heldSymbols = new Set<string>();
+    for (const position of positions) {
+      this.addHeldSymbol(heldSymbols, position.symbol);
+    }
 
     this.log("System", "executing_premarket_plan", {
       recommendations: this.state.premarketPlan.recommendations.length,
@@ -2868,12 +3325,13 @@ Response format:
 
     for (const rec of this.state.premarketPlan.recommendations) {
       if (rec.action === "BUY" && rec.confidence >= this.state.config.min_analyst_confidence) {
-        if (heldSymbols.has(rec.symbol)) continue;
+        if (heldSymbols.has(normalizeSymbol(rec.symbol))) continue;
         if (positions.length >= this.state.config.max_positions) break;
 
         const resultSymbol = await this.executeBuy(alpaca, rec.symbol, rec.confidence, account);
         if (resultSymbol) {
-          heldSymbols.add(resultSymbol);
+          this.addHeldSymbol(heldSymbols, resultSymbol);
+          this.addHeldSymbol(heldSymbols, rec.symbol);
 
           const originalSignal = this.state.signalCache.find(s => s.symbol === rec.symbol);
           this.state.positionEntries[resultSymbol] = {

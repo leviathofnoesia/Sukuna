@@ -62,7 +62,11 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
     this.policyConfig = storedPolicy ?? getDefaultPolicyConfig(this.env);
 
     if (this.env.OPENAI_API_KEY && this.env.FEATURE_LLM_RESEARCH === "true") {
-      this.llm = createOpenAIProvider({ apiKey: this.env.OPENAI_API_KEY });
+      const openaiConfig: { apiKey: string; baseUrl?: string } = { apiKey: this.env.OPENAI_API_KEY };
+      if (this.env.OPENAI_BASE_URL) {
+        openaiConfig.baseUrl = this.env.OPENAI_BASE_URL;
+      }
+      this.llm = createOpenAIProvider(openaiConfig);
     }
 
     this.options = alpaca.options;

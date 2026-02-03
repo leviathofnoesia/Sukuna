@@ -28,6 +28,7 @@
 	// - ALPACA_PAPER ("true" for paper trading)
 	// - TWITTER_BEARER_TOKEN
 	// - DISCORD_WEBHOOK_URL
+	// - OPENAI_BASE_URL (OpenAI-compatible base URL)
 	"d1_databases": [
 		{
 			"binding": "DB",

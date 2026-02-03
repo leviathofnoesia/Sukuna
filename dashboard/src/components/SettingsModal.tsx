@@ -195,6 +195,32 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
             </div>
           </div>
 
+          {/* Manual Watchlist */}
+          <div>
+            <h3 className="hud-label mb-3 text-hud-primary">Manual Watchlist (Stocks)</h3>
+            <div>
+              <label className="hud-label block mb-1">Tickers (comma-separated)</label>
+              <input
+                type="text"
+                className="hud-input w-full"
+                value={(localConfig.stock_watchlist_symbols || []).join(', ')}
+                onChange={e =>
+                  handleChange(
+                    'stock_watchlist_symbols',
+                    e.target.value
+                      .split(',')
+                      .map(s => s.trim().toUpperCase())
+                      .filter(Boolean) as unknown as string
+                  )
+                }
+                placeholder="AAPL, NVDA, MSFT, TSLA"
+              />
+              <p className="text-[9px] text-hud-text-dim mt-1">
+                Added symbols are appended to the signal cache every cycle.
+              </p>
+            </div>
+          </div>
+
           {/* LLM Config */}
           <div>
             <h3 className="hud-label mb-3 text-hud-primary">LLM Configuration</h3>

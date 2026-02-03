@@ -212,6 +212,8 @@ export default function App() {
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
   const [closingSymbol, setClosingSymbol] = useState<string | null>(null)
   const [layoutEdit, setLayoutEdit] = useState(false)
+  const [logFilter, setLogFilter] = useState<'all' | 'skips' | 'trades' | 'errors'>('all')
+  const [logReasonFilter, setLogReasonFilter] = useState<string | null>(null)
   const [layout, setLayout] = useState<LayoutItem[]>(() => {
     if (typeof window === 'undefined') return DEFAULT_LAYOUT
     try {
@@ -388,6 +390,32 @@ export default function App() {
   const costs = status?.costs || { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 }
   const config = status?.config
   const isMarketOpen = status?.clock?.is_open ?? false
+
+  const logReasonCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    logs.slice(-200).forEach((log) => {
+      const reason = typeof log.reason === 'string' ? log.reason : ''
+      if (!reason) return
+      counts.set(reason, (counts.get(reason) || 0) + 1)
+    })
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])
+  }, [logs])
+
+  const filteredLogs = useMemo(() => {
+    return logs.filter((log) => {
+      const action = (log.action || '').toLowerCase()
+      const reason = typeof log.reason === 'string' ? log.reason : ''
+      const isSkip = action.includes('skip') || action.includes('skipped')
+      const isTrade = action.includes('buy_executed') || action.includes('sell_executed') || action.includes('options_position_opened')
+      const isError = action.includes('failed') || action.includes('error')
+
+      if (logFilter === 'skips' && !isSkip) return false
+      if (logFilter === 'trades' && !isTrade) return false
+      if (logFilter === 'errors' && !isError) return false
+      if (logReasonFilter && reason !== logReasonFilter) return false
+      return true
+    })
+  }, [logs, logFilter, logReasonFilter])
 
   const { stockSignals, optionsSignals, cryptoSignals } = useMemo(() => {
     const crypto = signals.filter((sig) => sig.isCrypto)
@@ -696,9 +724,14 @@ export default function App() {
                       transition={{ delay: i * 0.02 }}
                       className="flex items-center justify-between gap-2 rounded-md px-2 py-1 border border-hud-line/10 hover:bg-hud-line/10 cursor-help"
                     >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="hud-value-sm">{sig.symbol}</span>
-                        <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="hud-value-sm">{sig.symbol}</span>
+                          <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                        </div>
+                        {sig.reason ? (
+                          <div className="text-[10px] text-hud-text-dim truncate">{sig.reason}</div>
+                        ) : null}
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="hud-label hidden sm:inline">VOL {sig.volume}</span>
@@ -743,10 +776,15 @@ export default function App() {
                       transition={{ delay: i * 0.02 }}
                       className="flex items-center justify-between gap-2 rounded-md px-2 py-1 border border-hud-line/10 hover:bg-hud-line/10 cursor-help"
                     >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-hud-purple text-xs">Δ</span>
-                        <span className="hud-value-sm">{sig.symbol}</span>
-                        <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-hud-purple text-xs">Δ</span>
+                          <span className="hud-value-sm">{sig.symbol}</span>
+                          <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                        </div>
+                        {sig.reason ? (
+                          <div className="text-[10px] text-hud-text-dim truncate">{sig.reason}</div>
+                        ) : null}
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="hud-label hidden sm:inline">VOL {sig.volume}</span>
@@ -791,10 +829,15 @@ export default function App() {
                       transition={{ delay: i * 0.02 }}
                       className="flex items-center justify-between gap-2 rounded-md px-2 py-1 border border-hud-line/10 hover:bg-hud-line/10 cursor-help"
                     >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-hud-warning text-xs">₿</span>
-                        <span className="hud-value-sm">{sig.symbol}</span>
-                        <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-hud-warning text-xs">₿</span>
+                          <span className="hud-value-sm">{sig.symbol}</span>
+                          <span className="hud-label text-hud-text-dim truncate">{sig.source.toUpperCase()}</span>
+                        </div>
+                        {sig.reason ? (
+                          <div className="text-[10px] text-hud-text-dim truncate">{sig.reason}</div>
+                        ) : null}
                       </div>
                       <div className="flex items-center gap-2">
                         {sig.momentum !== undefined ? (
@@ -860,31 +903,101 @@ export default function App() {
     ),
     activity_feed: (
       <Panel title="ACTIVITY FEED" titleRight="LIVE" className="h-full">
-        <div className="overflow-y-auto h-full font-mono text-xs space-y-1">
-          {logs.length === 0 ? (
-            <div className="text-hud-text-dim py-4 text-center">Waiting for activity...</div>
-          ) : (
-            logs.slice(-50).map((log: LogEntry, i: number) => (
-              <motion.div 
-                key={`${log.timestamp}-${i}`}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="flex items-start gap-2 py-1 border-b border-hud-line/10"
+        <div className="flex flex-col h-full">
+          <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-hud-line/20">
+            {(['all', 'skips', 'trades', 'errors'] as const).map((filter) => (
+              <button
+                key={filter}
+                type="button"
+                onClick={() => setLogFilter(filter)}
+                className={clsx(
+                  'rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.2em]',
+                  logFilter === filter
+                    ? 'border-hud-primary/60 text-hud-primary bg-hud-primary/10'
+                    : 'border-hud-line/30 text-hud-text-dim hover:text-hud-text'
+                )}
               >
-                <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[52px]">
-                  {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false })}
-                </span>
-                <span className={clsx('shrink-0 w-[72px] text-right', getAgentColor(log.agent))}>
-                  {log.agent}
-                </span>
-                <span className="text-hud-text flex-1 text-right wrap-break-word">
-                  {log.action}
-                  {log.symbol && <span className="text-hud-primary ml-1">({log.symbol})</span>}
-                </span>
-              </motion.div>
-            ))
-          )}
-          <div ref={logsEndRef} />
+                {filter}
+              </button>
+            ))}
+            {logReasonCounts.slice(0, 6).map(([reason, count]) => (
+              <button
+                key={reason}
+                type="button"
+                onClick={() => setLogReasonFilter((prev) => (prev === reason ? null : reason))}
+                className={clsx(
+                  'rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.08em]',
+                  logReasonFilter === reason
+                    ? 'border-hud-warning/60 text-hud-warning bg-hud-warning/10'
+                    : 'border-hud-line/30 text-hud-text-dim hover:text-hud-text'
+                )}
+              >
+                {reason} <span className="text-[9px] text-hud-text-dim">({count})</span>
+              </button>
+            ))}
+            {(logFilter !== 'all' || logReasonFilter) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setLogFilter('all')
+                  setLogReasonFilter(null)
+                }}
+                className="rounded-full border border-hud-line/30 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-hud-text-dim hover:text-hud-text"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <div className="overflow-y-auto flex-1 font-mono text-xs space-y-1 pt-2">
+            {filteredLogs.length === 0 ? (
+              <div className="text-hud-text-dim py-4 text-center">
+                No activity matches the current filters.
+              </div>
+            ) : (
+              filteredLogs.slice(-50).map((log: LogEntry, i: number) => {
+                const reason = typeof log.reason === 'string' ? log.reason : ''
+                const confidence = typeof log.confidence === 'number' ? log.confidence : null
+                const required = typeof log.required === 'number' ? log.required : null
+                return (
+                  <motion.div 
+                    key={`${log.timestamp}-${i}`}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="flex items-start gap-2 py-1 border-b border-hud-line/10"
+                  >
+                    <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[52px]">
+                      {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false })}
+                    </span>
+                    <span className={clsx('shrink-0 w-[72px] text-right', getAgentColor(log.agent))}>
+                      {log.agent}
+                    </span>
+                    <div className="text-hud-text flex-1 flex flex-wrap items-center justify-end gap-1">
+                      <span className="wrap-break-word">
+                        {log.action}
+                        {log.symbol && <span className="text-hud-primary ml-1">({log.symbol})</span>}
+                      </span>
+                      {reason ? (
+                        <span className="rounded-full border border-hud-warning/40 bg-hud-warning/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.14em] text-hud-warning">
+                          {reason}
+                        </span>
+                      ) : null}
+                      {confidence !== null ? (
+                        <span className="rounded-full border border-hud-line/30 px-2 py-0.5 text-[10px] text-hud-text-dim">
+                          C {Math.round(confidence * 100)}%
+                        </span>
+                      ) : null}
+                      {required !== null ? (
+                        <span className="rounded-full border border-hud-line/30 px-2 py-0.5 text-[10px] text-hud-text-dim">
+                          R {Math.round(required * 100)}%
+                        </span>
+                      ) : null}
+                    </div>
+                  </motion.div>
+                )
+              })
+            )}
+            <div ref={logsEndRef} />
+          </div>
         </div>
       </Panel>
     ),

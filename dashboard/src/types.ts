@@ -43,6 +43,9 @@ export interface LogEntry {
   agent: string
   action: string
   symbol?: string
+  reason?: string
+  confidence?: number
+  required?: number
   [key: string]: unknown
 }
 
@@ -105,6 +108,7 @@ export interface Config {
   crypto_min_analyst_confidence?: number
   crypto_universe_top_n?: number
   crypto_universe_refresh_ms?: number
+  stock_watchlist_symbols?: string[]
 }
 
 export interface SignalResearch {
@@ -217,6 +221,22 @@ export interface Status {
   premarketPlan?: PremarketPlan | null
   stalenessAnalysis?: Record<string, StalenessAnalysis>
   overnightActivity?: OvernightActivity
+  alphaScan?: {
+    updated_at: number
+    total: number
+    volume_pass: number
+    liquidity_pass: number
+    edge_pass: number
+    top_alpha: Array<{
+      symbol: string
+      isCrypto: boolean
+      notional_volume: number
+      spread_pct: number | null
+      implied_prob: number
+      calculated_prob: number
+      alpha: number
+    }>
+  }
   cryptoUniverse?: {
     provider?: string
     enabled: boolean
