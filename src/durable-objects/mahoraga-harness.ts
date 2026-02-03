@@ -1277,10 +1277,12 @@ export class MahoragaHarness extends DurableObject<Env> {
         }
       }
 
-      const impliedProb = this.computeImpliedProbability(dailyReturn, avgAbsReturn);
+      const impliedProb = market.isCrypto
+        ? 0.5
+        : this.computeImpliedProbability(dailyReturn, avgAbsReturn);
       const alpha = calcProb - impliedProb;
 
-      const minEdgeForMarket = market.isCrypto ? Math.min(minEdge, 0.02) : minEdge;
+      const minEdgeForMarket = market.isCrypto ? Math.min(minEdge, 0.01) : minEdge;
       if (Math.abs(alpha) < minEdgeForMarket) continue;
 
       edgePass.push({
@@ -1300,7 +1302,7 @@ export class MahoragaHarness extends DurableObject<Env> {
       .slice(0, 25);
 
     const topAlpha = edgePass
-      .filter((m) => m.alpha >= (m.isCrypto ? Math.min(edgeThreshold, 0.05) : edgeThreshold))
+      .filter((m) => m.alpha >= (m.isCrypto ? Math.min(edgeThreshold, 0.03) : edgeThreshold))
       .sort((a, b) => b.alpha - a.alpha)
       .slice(0, 10);
 
@@ -1675,7 +1677,7 @@ export class MahoragaHarness extends DurableObject<Env> {
         continue;
       }
 
-      const cryptoEdgeThreshold = Math.min(this.state.config.alpha_edge_threshold || 0.2, 0.05);
+      const cryptoEdgeThreshold = Math.min(this.state.config.alpha_edge_threshold || 0.2, 0.03);
       const alphaConfidence = this.computeAlphaConfidence(alphaEntry.alpha, cryptoEdgeThreshold);
       const research = await this.researchCryptoAlpha(signal, alphaEntry, alphaConfidence);
       if (research && research.verdict !== "BUY") {
