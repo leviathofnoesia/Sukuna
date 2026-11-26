@@ -23,6 +23,7 @@ export interface Clock {
 export interface Signal {
   symbol: string
   source: string
+  source_detail?: string
   sentiment: number
   volume: number
   reason: string
@@ -33,6 +34,8 @@ export interface Signal {
   isCrypto?: boolean
   momentum?: number
   price?: number
+  subreddits?: string[]
+  best_flair?: string | null
 }
 
 export interface LogEntry {
@@ -63,6 +66,7 @@ export interface Config {
   stop_loss_pct: number
   position_size_pct_of_cash: number
   llm_provider?: 'openai-raw' | 'ai-sdk' | 'cloudflare-gateway'
+  allowed_exchanges?: string[]
   llm_model: string
   llm_analyst_model?: string
   llm_max_tokens: number
@@ -99,6 +103,9 @@ export interface Config {
   crypto_max_position_value?: number
   crypto_take_profit_pct?: number
   crypto_stop_loss_pct?: number
+  crypto_min_analyst_confidence?: number
+  crypto_universe_top_n?: number
+  crypto_universe_refresh_ms?: number
 
   // Custom ticker blacklist (insider trading restrictions, etc.)
   ticker_blacklist?: string[]
@@ -214,4 +221,12 @@ export interface Status {
   premarketPlan?: PremarketPlan | null
   stalenessAnalysis?: Record<string, StalenessAnalysis>
   overnightActivity?: OvernightActivity
+  cryptoUniverse?: {
+    provider?: string
+    enabled: boolean
+    top_n: number
+    refresh_ms: number
+    last_updated_at: number
+    size: number
+  }
 }

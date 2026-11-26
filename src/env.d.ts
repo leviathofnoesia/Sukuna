@@ -20,6 +20,7 @@ export interface Env {
   LLM_MODEL?: string;
   TWITTER_BEARER_TOKEN?: string;
   DISCORD_WEBHOOK_URL?: string;
+  COINMARKETCAP_API_KEY?: string;
   MAHORAGA_API_TOKEN: string;
   KILL_SWITCH_SECRET: string;
 
@@ -36,5 +37,7 @@ export interface Env {
 }
 
 declare module "cloudflare:workers" {
-  interface Env extends Env { }
+  // Re-export the worker Env interface for Wrangler type generation.
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  interface Env extends Env {}
 }
