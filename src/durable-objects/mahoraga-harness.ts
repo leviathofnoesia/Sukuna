@@ -822,7 +822,7 @@ export class MahoragaHarness extends DurableObject<Env> {
           entry.peak_price = Math.max(entry.peak_price, pos.current_price);
         }
       }
-    } catch (e) {
+    } catch {
       // Ignore - will return null
     }
 
@@ -2482,7 +2482,7 @@ Response format:
       return;
     }
 
-    let assets: Asset[] = [];
+    let assets: Asset[];
     try {
       assets = await alpaca.trading.listAssets({ status: "active", asset_class: "crypto" });
     } catch (error) {

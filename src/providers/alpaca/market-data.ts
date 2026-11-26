@@ -160,8 +160,13 @@ export class AlpacaMarketDataProvider implements MarketDataProvider {
       // Fall through to IEX fallback.
     }
 
-    const fallback = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path, { feed: "iex" });
-    const quote = fallback.quotes[symbol];
+    let fallback: AlpacaQuotesResponse | undefined;
+    try {
+      fallback = await this.client.dataRequest<AlpacaQuotesResponse>("GET", path, { feed: "iex" });
+    } catch {
+      fallback = undefined;
+    }
+    const quote = fallback?.quotes[symbol];
     if (!quote) {
       try {
         const snapshot = await this.getSnapshot(symbol);
@@ -211,7 +216,7 @@ export class AlpacaMarketDataProvider implements MarketDataProvider {
 
   async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
     const path = "/v2/stocks/quotes/latest";
-    let response: AlpacaQuotesResponse | null = null;
+    let response: AlpacaQuotesResponse | null;
 
     try {
       response = await this.client.dataRequest<AlpacaQuotesResponse>(
@@ -224,11 +229,19 @@ export class AlpacaMarketDataProvider implements MarketDataProvider {
     }
 
     if (!response || Object.keys(response.quotes ?? {}).length === 0) {
-      response = await this.client.dataRequest<AlpacaQuotesResponse>(
-        "GET",
-        path,
-        { symbols: symbols.join(","), feed: "iex" }
-      );
+      try {
+        response = await this.client.dataRequest<AlpacaQuotesResponse>(
+          "GET",
+          path,
+          { symbols: symbols.join(","), feed: "iex" }
+        );
+      } catch {
+        response = null;
+      }
+    }
+
+    if (!response?.quotes) {
+      throw new Error(`No quote data for ${symbols.join(",")}`);
     }
 
     const result: Record<string, Quote> = {};

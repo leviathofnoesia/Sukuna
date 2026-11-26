@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, type ReactElement } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
@@ -41,6 +41,13 @@ function formatCurrency(amount: number): string {
 function formatPercent(value: number): string {
   const sign = value >= 0 ? '+' : ''
   return `${sign}${value.toFixed(2)}%`
+}
+
+function positionPlPercent(pos: Position): number | null {
+  const denom = pos.market_value - pos.unrealized_pl
+  if (!Number.isFinite(denom) || Math.abs(denom) <= Number.EPSILON) return null
+  const pct = (pos.unrealized_pl / denom) * 100
+  return Number.isFinite(pct) ? pct : null
 }
 
 function getAgentColor(agent: string): string {
@@ -275,7 +282,7 @@ export default function App() {
         } else {
           setError(data.error || 'Failed to fetch status')
         }
-      } catch (err) {
+      } catch {
         setError('Connection failed - is the agent running?')
       }
     }
@@ -445,7 +452,7 @@ export default function App() {
     }).filter(Boolean) as { label: string; data: number[]; variant: typeof positionColors[number] }[]
   }, [positions, positionPriceHistories])
 
-  const panelNodes: Record<string, JSX.Element> = {
+  const panelNodes: Record<string, ReactElement> = {
     account: (
       <Panel title="ACCOUNT" className="h-full">
         {account ? (
@@ -500,7 +507,7 @@ export default function App() {
               </thead>
               <tbody>
                 {positions.map((pos: Position) => {
-                  const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100
+                  const plPct = positionPlPercent(pos)
                   const priceHistory = positionPriceHistories[pos.symbol] || []
                   const posEntry = status?.positionEntries?.[pos.symbol]
                   const staleness = status?.stalenessAnalysis?.[pos.symbol]
@@ -551,7 +558,7 @@ export default function App() {
                         pos.unrealized_pl >= 0 ? 'text-hud-success' : 'text-hud-error'
                       )}>
                         <div>{formatCurrency(pos.unrealized_pl)}</div>
-                        <div className="text-xs opacity-70">{formatPercent(plPct)}</div>
+                        <div className="text-xs opacity-70">{plPct === null ? 'N/A' : formatPercent(plPct)}</div>
                       </td>
                       <td className="py-2 px-2">
                         <div className="flex justify-center">
@@ -623,7 +630,7 @@ export default function App() {
             <div className="flex flex-wrap gap-3 mb-2 pb-2 border-b border-hud-line/30 shrink-0">
               {positions.slice(0, 5).map((pos: Position, idx: number) => {
                 const isPositive = pos.unrealized_pl >= 0
-                const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100
+                const plPct = positionPlPercent(pos)
                 const color = positionColors[idx % positionColors.length]
                 return (
                   <div key={pos.symbol} className="flex items-center gap-1.5">
@@ -633,7 +640,7 @@ export default function App() {
                     />
                     <span className="hud-value-sm">{pos.symbol}</span>
                     <span className={clsx('hud-label', isPositive ? 'text-hud-success' : 'text-hud-error')}>
-                      {formatPercent(plPct)}
+                      {plPct === null ? 'N/A' : formatPercent(plPct)}
                     </span>
                   </div>
                 )

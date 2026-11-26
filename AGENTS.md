@@ -4,7 +4,7 @@
 - `src/` contains the Cloudflare Worker (TypeScript, ESM). Durable Objects live in `src/durable-objects/` and the main harness is `src/durable-objects/mahoraga-harness.ts`.
 - `dashboard/` is the React + Vite UI for monitoring and control.
 - `migrations/` holds D1 database migrations; `scripts/` contains setup helpers.
-- `docs/` stores extended documentation. `wrangler.jsonc` is the Worker config; `.env.example` and `agent-config.example.json` are templates.
+- `docs/` stores extended documentation. `wrangler.example.jsonc` is the Worker config template; `.env.example` and `agent-config.example.json` are templates.
 
 ## Build, Test, and Development Commands
 Run from the repo root unless noted:

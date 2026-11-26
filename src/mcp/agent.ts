@@ -349,13 +349,28 @@ export class MahoragaMcpAgent extends McpAgent<Env> {
 
           let estimatedPrice = input.limit_price ?? input.stop_price;
           if (!estimatedPrice) {
-            if (resolved.assetClass === "us_equity") {
-              try {
-                const quote = await alpaca.marketData.getQuote(resolved.symbol);
-                estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
-              } catch { estimatedPrice = 0; }
-            } else {
-              estimatedPrice = 0;
+            switch (resolved.assetClass) {
+              case "us_equity":
+                try {
+                  const quote = await alpaca.marketData.getQuote(resolved.symbol);
+                  estimatedPrice = input.side === "buy" ? quote.ask_price : quote.bid_price;
+                } catch { estimatedPrice = 0; }
+                break;
+              case "crypto":
+                try {
+                  const snapshot = await alpaca.marketData.getCryptoSnapshot(resolved.symbol);
+                  const quote = snapshot.latest_quote;
+                  const tradePrice = snapshot.latest_trade?.price || 0;
+                  estimatedPrice = input.side === "buy"
+                    ? (quote?.ask_price || tradePrice)
+                    : (quote?.bid_price || tradePrice);
+                } catch { estimatedPrice = 0; }
+                break;
+              default: {
+                const _exhaustive: never = resolved.assetClass;
+                estimatedPrice = 0;
+                void _exhaustive;
+              }
             }
           }
 

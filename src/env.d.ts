@@ -37,5 +37,7 @@ export interface Env {
 }
 
 declare module "cloudflare:workers" {
-  interface Env extends Env { }
+  // Re-export the worker Env interface for Wrangler type generation.
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  interface Env extends Env {}
 }
